@@ -138,6 +138,9 @@ pub struct Document {
     language_server: Option<Arc<helix_lsp::Client>>,
 
     diff_handle: Option<DiffHandle>,
+
+    // when document was used for most-recent-used buffer picker
+    pub used_at: std::time::Instant,
 }
 
 use std::{fmt, mem};
@@ -377,6 +380,7 @@ impl Document {
             modified_since_accessed: false,
             language_server: None,
             diff_handle: None,
+            used_at: std::time::Instant::now(),
         }
     }
 
@@ -766,6 +770,11 @@ impl Document {
         if self.selections.get(&view_id).is_none() {
             self.reset_selection(view_id);
         }
+    }
+
+    /// Mark document as recent used for MRU sorting
+    pub fn mark_as_used(&mut self) {
+        self.used_at = std::time::Instant::now();
     }
 
     /// Remove a view's selection from this document.
