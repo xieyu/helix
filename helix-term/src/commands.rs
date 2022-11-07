@@ -2342,7 +2342,7 @@ fn buffer_picker(cx: &mut Context) {
         path: doc.path().cloned(),
         is_modified: doc.is_modified(),
         is_current: doc.id() == current,
-        used_at: doc.used_at,
+        used_at: doc.focused_at,
     };
 
     let mut items = cx
@@ -2350,7 +2350,7 @@ fn buffer_picker(cx: &mut Context) {
         .documents
         .values()
         .map(|doc| new_meta(doc))
-        .collect();
+        .collect::<Vec<BufferMeta>>();
 
     // mru
     items.sort_by(|a, b| b.used_at.cmp(&a.used_at));

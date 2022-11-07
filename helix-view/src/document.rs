@@ -140,7 +140,7 @@ pub struct Document {
     diff_handle: Option<DiffHandle>,
 
     // when document was used for most-recent-used buffer picker
-    pub used_at: std::time::Instant,
+    pub focused_at: std::time::Instant,
 }
 
 use std::{fmt, mem};
@@ -380,7 +380,7 @@ impl Document {
             modified_since_accessed: false,
             language_server: None,
             diff_handle: None,
-            used_at: std::time::Instant::now(),
+            focused_at: std::time::Instant::now(),
         }
     }
 
@@ -774,7 +774,7 @@ impl Document {
 
     /// Mark document as recent used for MRU sorting
     pub fn mark_as_used(&mut self) {
-        self.used_at = std::time::Instant::now();
+        self.focused_at = std::time::Instant::now();
     }
 
     /// Remove a view's selection from this document.
