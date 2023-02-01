@@ -51,17 +51,19 @@
 "markup.heading" = "my_yellow1"
 "markup.list" = "my_white2"
 "markup.bold" = { modifiers = ["bold"] }
-"markup.italic" = {  modifiers = ["italic"] }
+"markup.italic" = { modifiers = ["italic"] }
+"markup.strikethrough" = { modifiers = ["crossed_out"] }
 "markup.link.url" = "my_turquoise2"
 "markup.link.text" = "my_white2"
 "markup.quote" = "my_brown"
 "markup.raw" = "my_green"
 
 "diff.plus" = "my_green"
-"diff.delta" = "my_white"
+"diff.delta" = "my_gray4"
 "diff.minus" = "my_red"
 
 "diagnostic" = { modifiers = ["underlined"] }
+"diagnostic.error" = { underline = { style = "curl", color = "my_red" } }
 "ui.gutter" = { bg = "my_gray0" }
 "hint" = "my_gray5"
 "debug" = "my_yellow2"
@@ -74,7 +76,7 @@ my_black      = "#212121" # Cursorline
 my_gray0      = "#262626" # Default Background
 my_gray1      = "#2b2b2b" # Ruler
 my_gray2      = "#323232" # Lighter Background (Used for status bars, line number and folding marks)
-my_gray3      = "#505050" # Selection Background
+my_gray3      = "#3d3d3d" # Selection Background
 my_gray4      = "#7c7c7c" # Comments, Invisibles, Line Highlighting
 my_gray5      = "#a8a8a8" # Dark Foreground (Used for status bars)
 my_gray6      = "#c8c8c8" # Light Foreground (Not often used)

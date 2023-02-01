@@ -4,10 +4,7 @@ use crate::job::Job;
 
 use super::*;
 
-use helix_view::{
-    apply_transaction,
-    editor::{Action, CloseError, ConfigEvent},
-};
+use helix_view::editor::{Action, CloseError, ConfigEvent};
 use ui::completers::{self, Completer};
 
 #[derive(Clone)]
@@ -65,12 +62,29 @@ fn open(cx: &mut compositor::Context, args: &[Cow<str>], event: PromptEvent) -> 
     ensure!(!args.is_empty(), "wrong argument count");
     for arg in args {
         let (path, pos) = args::parse_file(arg);
-        let _ = cx.editor.open(&path, Action::Replace)?;
-        let (view, doc) = current!(cx.editor);
-        let pos = Selection::point(pos_at_coords(doc.text().slice(..), pos, true));
-        doc.set_selection(view.id, pos);
-        // does not affect opening a buffer without pos
-        align_view(doc, view, Align::Center);
+        let path = helix_core::path::expand_tilde(&path);
+        // If the path is a directory, open a file picker on that directory and update the status
+        // message
+        if let Ok(true) = std::fs::canonicalize(&path).map(|p| p.is_dir()) {
+            let callback = async move {
+                let call: job::Callback = job::Callback::EditorCompositor(Box::new(
+                    move |editor: &mut Editor, compositor: &mut Compositor| {
+                        let picker = ui::file_picker(path, &editor.config());
+                        compositor.push(Box::new(overlayed(picker)));
+                    },
+                ));
+                Ok(call)
+            };
+            cx.jobs.callback(callback);
+        } else {
+            // Otherwise, just open the file
+            let _ = cx.editor.open(&path, Action::Replace)?;
+            let (view, doc) = current!(cx.editor);
+            let pos = Selection::point(pos_at_coords(doc.text().slice(..), pos, true));
+            doc.set_selection(view.id, pos);
+            // does not affect opening a buffer without pos
+            align_view(doc, view, Align::Center);
+        }
     }
     Ok(())
 }
@@ -463,7 +477,7 @@ fn set_line_ending(
             }
         }),
     );
-    apply_transaction(&transaction, doc, view);
+    doc.apply(&transaction, view.id);
     doc.append_changes_to_history(view);
 
     Ok(())
@@ -777,7 +791,7 @@ fn theme(
                     .editor
                     .theme_loader
                     .load(theme_name)
-                    .with_context(|| "Theme does not exist")?;
+                    .map_err(|err| anyhow::anyhow!("Could not load theme: {}", err))?;
                 if !(true_color || theme.is_16_color()) {
                     bail!("Unsupported theme: theme requires true color support");
                 }
@@ -908,7 +922,7 @@ fn replace_selections_with_clipboard_impl(
                 (range.from(), range.to(), Some(contents.as_str().into()))
             });
 
-            apply_transaction(&transaction, doc, view);
+            doc.apply(&transaction, view.id);
             doc.append_changes_to_history(view);
             Ok(())
         }
@@ -1579,7 +1593,7 @@ fn sort_impl(
             .map(|(s, fragment)| (s.from(), s.to(), Some(fragment))),
     );
 
-    apply_transaction(&transaction, doc, view);
+    doc.apply(&transaction, view.id);
     doc.append_changes_to_history(view);
 
     Ok(())
@@ -1623,7 +1637,7 @@ fn reflow(
         (range.from(), range.to(), Some(reflowed_text))
     });
 
-    apply_transaction(&transaction, doc, view);
+    doc.apply(&transaction, view.id);
     doc.append_changes_to_history(view);
     view.ensure_cursor_in_view(doc, scrolloff);
 
@@ -1741,13 +1755,30 @@ fn insert_output(
     Ok(())
 }
 
+fn pipe_to(
+    cx: &mut compositor::Context,
+    args: &[Cow<str>],
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    pipe_impl(cx, args, event, &ShellBehavior::Ignore)
+}
+
 fn pipe(cx: &mut compositor::Context, args: &[Cow<str>], event: PromptEvent) -> anyhow::Result<()> {
+    pipe_impl(cx, args, event, &ShellBehavior::Replace)
+}
+
+fn pipe_impl(
+    cx: &mut compositor::Context,
+    args: &[Cow<str>],
+    event: PromptEvent,
+    behavior: &ShellBehavior,
+) -> anyhow::Result<()> {
     if event != PromptEvent::Validate {
         return Ok(());
     }
 
     ensure!(!args.is_empty(), "Shell command required");
-    shell(cx, &args.join(" "), &ShellBehavior::Replace);
+    shell(cx, &args.join(" "), behavior);
     Ok(())
 }
 
@@ -1763,7 +1794,7 @@ fn run_shell_command(
     let shell = &cx.editor.config().shell;
     let (output, success) = shell_impl(shell, &args.join(" "), None)?;
     if success {
-        cx.editor.set_status("Command succeed");
+        cx.editor.set_status("Command succeeded");
     } else {
         cx.editor.set_error("Command failed");
     }
@@ -2293,11 +2324,18 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
             completer: None,
         },
         TypableCommand {
+            name: "pipe-to",
+            aliases: &[],
+            doc: "Pipe each selection to the shell command, ignoring output.",
+            fun: pipe_to,
+            completer: None,
+        },
+        TypableCommand {
             name: "run-shell-command",
             aliases: &["sh"],
             doc: "Run a shell command",
             fun: run_shell_command,
-            completer: Some(completers::directory),
+            completer: Some(completers::filename),
         },
     ];
 

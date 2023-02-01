@@ -172,7 +172,7 @@ impl Application {
             area,
             theme_loader.clone(),
             syn_loader.clone(),
-            Box::new(Map::new(Arc::clone(&config), |config: &Config| {
+            Arc::new(Map::new(Arc::clone(&config), |config: &Config| {
                 &config.editor
             })),
         );
@@ -227,7 +227,11 @@ impl Application {
                         doc.set_selection(view_id, pos);
                     }
                 }
-                editor.set_status(format!("Loaded {} files.", nr_of_files));
+                editor.set_status(format!(
+                    "Loaded {} file{}.",
+                    nr_of_files,
+                    if nr_of_files == 1 { "" } else { "s" } // avoid "Loaded 1 files." grammo
+                ));
                 // align the view to center after all files are loaded,
                 // does not affect views without pos since it is at the top
                 let (view, doc) = current!(editor);
@@ -305,8 +309,10 @@ impl Application {
         let surface = self.terminal.current_buffer_mut();
 
         self.compositor.render(area, surface, &mut cx);
-
         let (pos, kind) = self.compositor.cursor(area, &self.editor);
+        // reset cursor cache
+        self.editor.cursor_cache.set(None);
+
         let pos = pos.map(|pos| (pos.col as u16, pos.row as u16));
         self.terminal.draw(pos, kind).unwrap();
     }
@@ -391,36 +397,62 @@ impl Application {
         // Update all the relevant members in the editor after updating
         // the configuration.
         self.editor.refresh_config();
-    }
 
-    /// Refresh theme after config change
-    fn refresh_theme(&mut self, config: &Config) {
-        if let Some(theme) = config.theme.clone() {
-            let true_color = self.true_color();
-            match self.theme_loader.load(&theme) {
-                Ok(theme) => {
-                    if true_color || theme.is_16_color() {
-                        self.editor.set_theme(theme);
-                    } else {
-                        self.editor
-                            .set_error("theme requires truecolor support, which is not available");
-                    }
-                }
-                Err(err) => {
-                    let err_string = format!("failed to load theme `{}` - {}", theme, err);
-                    self.editor.set_error(err_string);
-                }
-            }
+        // reset view position in case softwrap was enabled/disabled
+        let scrolloff = self.editor.config().scrolloff;
+        for (view, _) in self.editor.tree.views_mut() {
+            let doc = &self.editor.documents[&view.doc];
+            view.ensure_cursor_in_view(doc, scrolloff)
         }
     }
 
-    fn refresh_config(&mut self) {
-        match Config::load_default() {
-            Ok(config) => {
-                self.refresh_theme(&config);
+    /// refresh language config after config change
+    fn refresh_language_config(&mut self) -> Result<(), Error> {
+        let syntax_config = helix_core::config::user_syntax_loader()
+            .map_err(|err| anyhow::anyhow!("Failed to load language config: {}", err))?;
 
-                // Store new config
-                self.config.store(Arc::new(config));
+        self.syn_loader = std::sync::Arc::new(syntax::Loader::new(syntax_config));
+        self.editor.syn_loader = self.syn_loader.clone();
+        for document in self.editor.documents.values_mut() {
+            document.detect_language(self.syn_loader.clone());
+        }
+
+        Ok(())
+    }
+
+    /// Refresh theme after config change
+    fn refresh_theme(&mut self, config: &Config) -> Result<(), Error> {
+        if let Some(theme) = config.theme.clone() {
+            let true_color = self.true_color();
+            let theme = self
+                .theme_loader
+                .load(&theme)
+                .map_err(|err| anyhow::anyhow!("Failed to load theme `{}`: {}", theme, err))?;
+
+            if true_color || theme.is_16_color() {
+                self.editor.set_theme(theme);
+            } else {
+                anyhow::bail!("theme requires truecolor support, which is not available")
+            }
+        }
+
+        Ok(())
+    }
+
+    fn refresh_config(&mut self) {
+        let mut refresh_config = || -> Result<(), Error> {
+            let default_config = Config::load_default()
+                .map_err(|err| anyhow::anyhow!("Failed to load config: {}", err))?;
+            self.refresh_language_config()?;
+            self.refresh_theme(&default_config)?;
+            // Store new config
+            self.config.store(Arc::new(default_config));
+            Ok(())
+        };
+
+        match refresh_config() {
+            Ok(_) => {
+                self.editor.set_status("Config refreshed");
             }
             Err(err) => {
                 self.editor.set_error(err.to_string());

@@ -1,20 +1,25 @@
+use futures_util::FutureExt;
 use helix_lsp::{
     block_on,
     lsp::{self, CodeAction, CodeActionOrCommand, DiagnosticSeverity, NumberOrString},
     util::{diagnostic_to_lsp_diagnostic, lsp_pos_to_pos, lsp_range_to_range, range_to_lsp_range},
     OffsetEncoding,
 };
-use tui::text::{Span, Spans};
+use tui::{
+    text::{Span, Spans},
+    widgets::Row,
+};
 
 use super::{align_view, push_jump, Align, Context, Editor, Open};
 
 use helix_core::{path, Selection};
-use helix_view::{apply_transaction, document::Mode, editor::Action, theme::Style};
+use helix_view::{document::Mode, editor::Action, theme::Style};
 
 use crate::{
     compositor::{self, Compositor},
     ui::{
-        self, lsp::SignatureHelp, overlay::overlayed, FileLocation, FilePicker, Popup, PromptEvent,
+        self, lsp::SignatureHelp, overlay::overlayed, DynamicPicker, FileLocation, FilePicker,
+        Popup, PromptEvent,
     },
 };
 
@@ -44,7 +49,7 @@ impl ui::menu::Item for lsp::Location {
     /// Current working directory.
     type Data = PathBuf;
 
-    fn label(&self, cwdir: &Self::Data) -> Spans {
+    fn format(&self, cwdir: &Self::Data) -> Row {
         // The preallocation here will overallocate a few characters since it will account for the
         // URL's scheme, which is not used most of the time since that scheme will be "file://".
         // Those extra chars will be used to avoid allocating when writing the line number (in the
@@ -78,7 +83,7 @@ impl ui::menu::Item for lsp::SymbolInformation {
     /// Path to currently focussed document
     type Data = Option<lsp::Url>;
 
-    fn label(&self, current_doc_path: &Self::Data) -> Spans {
+    fn format(&self, current_doc_path: &Self::Data) -> Row {
         if current_doc_path.as_ref() == Some(&self.location.uri) {
             self.name.as_str().into()
         } else {
@@ -108,7 +113,7 @@ struct PickerDiagnostic {
 impl ui::menu::Item for PickerDiagnostic {
     type Data = (DiagnosticStyles, DiagnosticsFormat);
 
-    fn label(&self, (styles, format): &Self::Data) -> Spans {
+    fn format(&self, (styles, format): &Self::Data) -> Row {
         let mut style = self
             .diag
             .severity
@@ -147,6 +152,7 @@ impl ui::menu::Item for PickerDiagnostic {
             Span::styled(&self.diag.message, style),
             Span::styled(code, style),
         ])
+        .into()
     }
 }
 
@@ -384,10 +390,43 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
     cx.callback(
         future,
         move |_editor, compositor, response: Option<Vec<lsp::SymbolInformation>>| {
-            if let Some(symbols) = response {
-                let picker = sym_picker(symbols, current_url, offset_encoding);
-                compositor.push(Box::new(overlayed(picker)))
-            }
+            let symbols = response.unwrap_or_default();
+            let picker = sym_picker(symbols, current_url, offset_encoding);
+            let get_symbols = |query: String, editor: &mut Editor| {
+                let doc = doc!(editor);
+                let language_server = match doc.language_server() {
+                    Some(s) => s,
+                    None => {
+                        // This should not generally happen since the picker will not
+                        // even open in the first place if there is no server.
+                        return async move { Err(anyhow::anyhow!("LSP not active")) }.boxed();
+                    }
+                };
+                let symbol_request = match language_server.workspace_symbols(query) {
+                    Some(future) => future,
+                    None => {
+                        // This should also not happen since the language server must have
+                        // supported workspace symbols before to reach this block.
+                        return async move {
+                            Err(anyhow::anyhow!(
+                                "Language server does not support workspace symbols"
+                            ))
+                        }
+                        .boxed();
+                    }
+                };
+
+                let future = async move {
+                    let json = symbol_request.await?;
+                    let response: Option<Vec<lsp::SymbolInformation>> =
+                        serde_json::from_value(json)?;
+
+                    Ok(response.unwrap_or_default())
+                };
+                future.boxed()
+            };
+            let dyn_picker = DynamicPicker::new(picker, Box::new(get_symbols));
+            compositor.push(Box::new(overlayed(dyn_picker)))
         },
     )
 }
@@ -432,7 +471,7 @@ pub fn workspace_diagnostics_picker(cx: &mut Context) {
 
 impl ui::menu::Item for lsp::CodeActionOrCommand {
     type Data = ();
-    fn label(&self, _data: &Self::Data) -> Spans {
+    fn format(&self, _data: &Self::Data) -> Row {
         match self {
             lsp::CodeActionOrCommand::CodeAction(action) => action.title.as_str().into(),
             lsp::CodeActionOrCommand::Command(command) => command.title.as_str().into(),
@@ -627,7 +666,7 @@ pub fn code_action(cx: &mut Context) {
 
 impl ui::menu::Item for lsp::Command {
     type Data = ();
-    fn label(&self, _data: &Self::Data) -> Spans {
+    fn format(&self, _data: &Self::Data) -> Row {
         self.title.as_str().into()
     }
 }
@@ -761,7 +800,7 @@ pub fn apply_workspace_edit(
             offset_encoding,
         );
         let view = view_mut!(editor, view_id);
-        apply_transaction(&transaction, doc, view);
+        doc.apply(&transaction, view.id);
         doc.append_changes_to_history(view);
     };
 
@@ -873,6 +912,31 @@ fn to_locations(definitions: Option<lsp::GotoDefinitionResponse>) -> Vec<lsp::Lo
             .collect(),
         None => Vec::new(),
     }
+}
+
+pub fn goto_declaration(cx: &mut Context) {
+    let (view, doc) = current!(cx.editor);
+    let language_server = language_server!(cx.editor, doc);
+    let offset_encoding = language_server.offset_encoding();
+
+    let pos = doc.position(view.id, offset_encoding);
+
+    let future = match language_server.goto_declaration(doc.identifier(), pos, None) {
+        Some(future) => future,
+        None => {
+            cx.editor
+                .set_error("Language server does not support goto-declaration");
+            return;
+        }
+    };
+
+    cx.callback(
+        future,
+        move |editor, compositor, response: Option<lsp::GotoDefinitionResponse>| {
+            let items = to_locations(response);
+            goto_impl(editor, compositor, items, offset_encoding);
+        },
+    );
 }
 
 pub fn goto_definition(cx: &mut Context) {
