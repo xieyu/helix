@@ -31,7 +31,7 @@ use std::{
 use tokio::{
     sync::{
         mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-        Notify, RwLock,
+        oneshot, Notify, RwLock,
     },
     time::{sleep, Duration, Instant, Sleep},
 };
@@ -40,12 +40,12 @@ use anyhow::{anyhow, bail, Error};
 
 pub use helix_core::diagnostic::Severity;
 pub use helix_core::register::Registers;
-use helix_core::Position;
 use helix_core::{
     auto_pairs::AutoPairs,
-    syntax::{self, AutoPairConfig},
+    syntax::{self, AutoPairConfig, SoftWrap},
     Change,
 };
+use helix_core::{Position, Selection};
 use helix_dap as dap;
 use helix_lsp::lsp;
 
@@ -173,6 +173,8 @@ pub struct FilePickerConfig {
     /// Enables following symlinks.
     /// Whether to follow symbolic links in file picker and file or directory completions. Defaults to true.
     pub follow_symlinks: bool,
+    /// Hides symlinks that point into the current directory. Defaults to true.
+    pub deduplicate_links: bool,
     /// Enables reading ignore files from parent directories. Defaults to true.
     pub parents: bool,
     /// Enables reading `.ignore` files.
@@ -197,6 +199,7 @@ impl Default for FilePickerConfig {
         Self {
             hidden: true,
             follow_symlinks: true,
+            deduplicate_links: true,
             parents: true,
             ignore: true,
             git_ignore: true,
@@ -238,6 +241,8 @@ pub struct Config {
     pub auto_format: bool,
     /// Automatic save on focus lost. Defaults to false.
     pub auto_save: bool,
+    /// Set a global text_width
+    pub text_width: usize,
     /// Time in milliseconds since last keypress before idle timers trigger.
     /// Used for autocompletion, set to 0 for instant. Defaults to 400ms.
     #[serde(
@@ -246,6 +251,9 @@ pub struct Config {
     )]
     pub idle_timeout: Duration,
     pub completion_trigger_len: u8,
+    /// Whether to instruct the LSP to replace the entire word when applying a completion
+    /// or to only insert new text
+    pub completion_replace: bool,
     /// Whether to display infoboxes. Defaults to true.
     pub auto_info: bool,
     pub file_picker: FilePickerConfig,
@@ -271,43 +279,6 @@ pub struct Config {
     /// Whether to color modes with different colors. Defaults to `false`.
     pub color_modes: bool,
     pub soft_wrap: SoftWrap,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
-pub struct SoftWrap {
-    /// Soft wrap lines that exceed viewport width. Default to off
-    pub enable: bool,
-    /// Maximum space left free at the end of the line.
-    /// This space is used to wrap text at word boundaries. If that is not possible within this limit
-    /// the word is simply split at the end of the line.
-    ///
-    /// This is automatically hard-limited to a quarter of the viewport to ensure correct display on small views.
-    ///
-    /// Default to 20
-    pub max_wrap: u16,
-    /// Maximum number of indentation that can be carried over from the previous line when softwrapping.
-    /// If a line is indented further then this limit it is rendered at the start of the viewport instead.
-    ///
-    /// This is automatically hard-limited to a quarter of the viewport to ensure correct display on small views.
-    ///
-    /// Default to 40
-    pub max_indent_retain: u16,
-    /// Indicator placed at the beginning of softwrapped lines
-    ///
-    /// Defaults to ↪
-    pub wrap_indicator: String,
-}
-
-impl Default for SoftWrap {
-    fn default() -> Self {
-        SoftWrap {
-            enable: false,
-            max_wrap: 20,
-            max_indent_retain: 40,
-            wrap_indicator: "↪ ".into(),
-        }
-    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -366,20 +337,26 @@ pub fn get_terminal_provider() -> Option<TerminalConfig> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct LspConfig {
+    /// Enables LSP
+    pub enable: bool,
     /// Display LSP progress messages below statusline
     pub display_messages: bool,
     /// Enable automatic pop up of signature help (parameter hints)
     pub auto_signature_help: bool,
     /// Display docs under signature help popup
     pub display_signature_help_docs: bool,
+    /// Display inlay hints
+    pub display_inlay_hints: bool,
 }
 
 impl Default for LspConfig {
     fn default() -> Self {
         Self {
+            enable: true,
             display_messages: false,
             auto_signature_help: true,
             display_signature_help_docs: true,
+            display_inlay_hints: false,
         }
     }
 }
@@ -408,7 +385,12 @@ impl Default for StatusLineConfig {
         use StatusLineElement as E;
 
         Self {
-            left: vec![E::Mode, E::Spinner, E::FileName],
+            left: vec![
+                E::Mode,
+                E::Spinner,
+                E::FileName,
+                E::FileModificationIndicator,
+            ],
             center: vec![],
             right: vec![E::Diagnostics, E::Selections, E::Position, E::FileEncoding],
             separator: String::from("│"),
@@ -450,6 +432,9 @@ pub enum StatusLineElement {
     /// The relative file path, including a dirty flag if it's unsaved
     FileName,
 
+    // The file modification indicator
+    FileModificationIndicator,
+
     /// The file encoding
     FileEncoding,
 
@@ -485,6 +470,9 @@ pub enum StatusLineElement {
 
     /// A single space
     Spacer,
+
+    /// Current version control information
+    VersionControl,
 }
 
 // Cursor shape is read and used on every rendered frame and so needs
@@ -758,6 +746,8 @@ impl Default for Config {
             indent_guides: IndentGuidesConfig::default(),
             color_modes: false,
             soft_wrap: SoftWrap::default(),
+            text_width: 80,
+            completion_replace: false,
         }
     }
 }
@@ -834,7 +824,12 @@ pub struct Editor {
     /// The currently applied editor theme. While previewing a theme, the previewed theme
     /// is set here.
     pub theme: Theme,
-    pub last_line_number: Option<usize>,
+
+    /// The primary Selection prior to starting a goto_line_number preview. This is
+    /// restored when the preview is aborted, or added to the jumplist when it is
+    /// confirmed.
+    pub last_selection: Option<Selection>,
+
     pub status_msg: Option<(Cow<'static, str>, Severity)>,
     pub autoinfo: Option<Info>,
 
@@ -867,6 +862,14 @@ pub struct Editor {
     /// avoid calculating the cursor position multiple
     /// times during rendering and should not be set by other functions.
     pub cursor_cache: Cell<Option<Option<Position>>>,
+    /// When a new completion request is sent to the server old
+    /// unifinished request must be dropped. Each completion
+    /// request is associated with a channel that cancels
+    /// when the channel is dropped. That channel is stored
+    /// here. When a new completion request is sent this
+    /// field is set and any old requests are automatically
+    /// canceled as a result
+    pub completion_request_handle: Option<oneshot::Sender<()>>,
 }
 
 pub type RedrawHandle = (Arc<Notify>, Arc<RwLock<()>>);
@@ -950,7 +953,7 @@ impl Editor {
             syn_loader,
             theme_loader,
             last_theme: None,
-            last_line_number: None,
+            last_selection: None,
             registers: Registers::default(),
             clipboard_provider: get_clipboard_provider(),
             status_msg: None,
@@ -965,6 +968,7 @@ impl Editor {
             redraw_handle: Default::default(),
             needs_redraw: false,
             cursor_cache: Cell::new(None),
+            completion_request_handle: None,
         }
     }
 
@@ -1074,18 +1078,25 @@ impl Editor {
 
     /// Refreshes the language server for a given document
     pub fn refresh_language_server(&mut self, doc_id: DocumentId) -> Option<()> {
-        let doc = self.documents.get_mut(&doc_id)?;
-        Self::launch_language_server(&mut self.language_servers, doc)
+        self.launch_language_server(doc_id)
     }
 
     /// Launch a language server for a given document
-    fn launch_language_server(ls: &mut helix_lsp::Registry, doc: &mut Document) -> Option<()> {
+    fn launch_language_server(&mut self, doc_id: DocumentId) -> Option<()> {
+        if !self.config().lsp.enable {
+            return None;
+        }
+
         // if doc doesn't have a URL it's a scratch buffer, ignore it
-        let doc_url = doc.url()?;
+        let (lang, path) = {
+            let doc = self.document(doc_id)?;
+            (doc.language.clone(), doc.path().cloned())
+        };
 
         // try to find a language server based on the language name
-        let language_server = doc.language.as_ref().and_then(|language| {
-            ls.get(language, doc.path())
+        let language_server = lang.as_ref().and_then(|language| {
+            self.language_servers
+                .get(language, path.as_ref())
                 .map_err(|e| {
                     log::error!(
                         "Failed to initialize the LSP for `{}` {{ {} }}",
@@ -1096,6 +1107,10 @@ impl Editor {
                 .ok()
                 .flatten()
         });
+
+        let doc = self.document_mut(doc_id)?;
+        let doc_url = doc.url()?;
+
         if let Some(language_server) = language_server {
             // only spawn a new lang server if the servers aren't the same
             if Some(language_server.id()) != doc.language_server().map(|server| server.id()) {
@@ -1121,6 +1136,19 @@ impl Editor {
 
     fn _refresh(&mut self) {
         let config = self.config();
+
+        // Reset the inlay hints annotations *before* updating the views, that way we ensure they
+        // will disappear during the `.sync_change(doc)` call below.
+        //
+        // We can't simply check this config when rendering because inlay hints are only parts of
+        // the possible annotations, and others could still be active, so we need to selectively
+        // drop the inlay hints.
+        if !config.lsp.display_inlay_hints {
+            for doc in self.documents_mut() {
+                doc.reset_all_inlay_hints();
+            }
+        }
+
         for (view, _) in self.tree.views_mut() {
             let doc = doc_mut!(self, &view.doc);
             view.sync_changes(doc);
@@ -1288,11 +1316,15 @@ impl Editor {
                 self.config.clone(),
             )?;
 
-            let _ = Self::launch_language_server(&mut self.language_servers, &mut doc);
             if let Some(diff_base) = self.diff_providers.get_diff_base(&path) {
                 doc.set_diff_base(diff_base, self.redraw_handle.clone());
             }
-            self.new_document(doc)
+            doc.set_version_control_head(self.diff_providers.get_current_head_name(&path));
+
+            let id = self.new_document(doc);
+            let _ = self.launch_language_server(id);
+
+            id
         };
 
         self.switch(id, action);

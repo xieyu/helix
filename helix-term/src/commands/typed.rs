@@ -1,10 +1,14 @@
+use std::fmt::Write;
 use std::ops::Deref;
 
 use crate::job::Job;
 
 use super::*;
 
+use helix_core::encoding;
+use helix_view::document::DEFAULT_LANGUAGE_NAME;
 use helix_view::editor::{Action, CloseError, ConfigEvent};
+use serde_json::Value;
 use ui::completers::{self, Completer};
 
 #[derive(Clone)]
@@ -913,6 +917,7 @@ fn replace_selections_with_clipboard_impl(
     cx: &mut compositor::Context,
     clipboard_type: ClipboardType,
 ) -> anyhow::Result<()> {
+    let scrolloff = cx.editor.config().scrolloff;
     let (view, doc) = current!(cx.editor);
 
     match cx.editor.clipboard_provider.get_contents(clipboard_type) {
@@ -924,6 +929,7 @@ fn replace_selections_with_clipboard_impl(
 
             doc.apply(&transaction, view.id);
             doc.append_changes_to_history(view);
+            view.ensure_cursor_in_view(doc, scrolloff);
             Ok(())
         }
         Err(e) => Err(e.context("Couldn't get system clipboard contents")),
@@ -1029,6 +1035,131 @@ fn set_encoding(
         cx.editor.set_status(encoding);
         Ok(())
     }
+}
+
+/// Shows info about the character under the primary cursor.
+fn get_character_info(
+    cx: &mut compositor::Context,
+    _args: &[Cow<str>],
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let (view, doc) = current_ref!(cx.editor);
+    let text = doc.text().slice(..);
+
+    let grapheme_start = doc.selection(view.id).primary().cursor(text);
+    let grapheme_end = graphemes::next_grapheme_boundary(text, grapheme_start);
+
+    if grapheme_start == grapheme_end {
+        return Ok(());
+    }
+
+    let grapheme = text.slice(grapheme_start..grapheme_end).to_string();
+    let encoding = doc.encoding();
+
+    let printable = grapheme.chars().fold(String::new(), |mut s, c| {
+        match c {
+            '\0' => s.push_str("\\0"),
+            '\t' => s.push_str("\\t"),
+            '\n' => s.push_str("\\n"),
+            '\r' => s.push_str("\\r"),
+            _ => s.push(c),
+        }
+
+        s
+    });
+
+    // Convert to Unicode codepoints if in UTF-8
+    let unicode = if encoding == encoding::UTF_8 {
+        let mut unicode = " (".to_owned();
+
+        for (i, char) in grapheme.chars().enumerate() {
+            if i != 0 {
+                unicode.push(' ');
+            }
+
+            unicode.push_str("U+");
+
+            let codepoint: u32 = if char.is_ascii() {
+                char.into()
+            } else {
+                // Not ascii means it will be multi-byte, so strip out the extra
+                // bits that encode the length & mark continuation bytes
+
+                let s = String::from(char);
+                let bytes = s.as_bytes();
+
+                // First byte starts with 2-4 ones then a zero, so strip those off
+                let first = bytes[0];
+                let codepoint = first & (0xFF >> (first.leading_ones() + 1));
+                let mut codepoint = u32::from(codepoint);
+
+                // Following bytes start with 10
+                for byte in bytes.iter().skip(1) {
+                    codepoint <<= 6;
+                    codepoint += u32::from(*byte) & 0x3F;
+                }
+
+                codepoint
+            };
+
+            write!(unicode, "{codepoint:0>4x}").unwrap();
+        }
+
+        unicode.push(')');
+        unicode
+    } else {
+        String::new()
+    };
+
+    // Give the decimal value for ascii characters
+    let dec = if encoding.is_ascii_compatible() && grapheme.len() == 1 {
+        format!(" Dec {}", grapheme.as_bytes()[0])
+    } else {
+        String::new()
+    };
+
+    let hex = {
+        let mut encoder = encoding.new_encoder();
+        let max_encoded_len = encoder
+            .max_buffer_length_from_utf8_without_replacement(grapheme.len())
+            .unwrap();
+        let mut bytes = Vec::with_capacity(max_encoded_len);
+        let mut current_byte = 0;
+        let mut hex = String::new();
+
+        for (i, char) in grapheme.chars().enumerate() {
+            if i != 0 {
+                hex.push_str(" +");
+            }
+
+            let (result, _input_bytes_read) = encoder.encode_from_utf8_to_vec_without_replacement(
+                &char.to_string(),
+                &mut bytes,
+                true,
+            );
+
+            if let encoding::EncoderResult::Unmappable(char) = result {
+                bail!("{char:?} cannot be mapped to {}", encoding.name());
+            }
+
+            for byte in &bytes[current_byte..] {
+                write!(hex, " {byte:0>2x}").unwrap();
+            }
+
+            current_byte = bytes.len();
+        }
+
+        hex
+    };
+
+    cx.editor
+        .set_status(format!("\"{printable}\"{unicode}{dec} Hex{hex}"));
+
+    Ok(())
 }
 
 /// Reload the [`Document`] from its source file.
@@ -1223,6 +1354,37 @@ fn lsp_restart(
     Ok(())
 }
 
+fn lsp_stop(
+    cx: &mut compositor::Context,
+    _args: &[Cow<str>],
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    let doc = doc!(cx.editor);
+
+    let ls_id = doc
+        .language_server()
+        .map(|ls| ls.id())
+        .context("LSP not running for the current document")?;
+
+    let config = doc
+        .language_config()
+        .context("LSP not defined for the current document")?;
+    cx.editor.language_servers.stop(config);
+
+    for doc in cx.editor.documents_mut() {
+        if doc.language_server().map_or(false, |ls| ls.id() == ls_id) {
+            doc.set_language_server(None);
+            doc.set_diagnostics(Default::default());
+        }
+    }
+
+    Ok(())
+}
+
 fn tree_sitter_scopes(
     cx: &mut compositor::Context,
     _args: &[Cow<str>],
@@ -1403,10 +1565,39 @@ fn tutor(
         return Ok(());
     }
 
-    let path = helix_loader::runtime_dir().join("tutor");
+    let path = helix_loader::runtime_file(Path::new("tutor"));
     cx.editor.open(&path, Action::Replace)?;
     // Unset path to prevent accidentally saving to the original tutor file.
     doc_mut!(cx.editor).set_path(None)?;
+    Ok(())
+}
+
+fn abort_goto_line_number_preview(cx: &mut compositor::Context) {
+    if let Some(last_selection) = cx.editor.last_selection.take() {
+        let scrolloff = cx.editor.config().scrolloff;
+
+        let (view, doc) = current!(cx.editor);
+        doc.set_selection(view.id, last_selection);
+        view.ensure_cursor_in_view(doc, scrolloff);
+    }
+}
+
+fn update_goto_line_number_preview(
+    cx: &mut compositor::Context,
+    args: &[Cow<str>],
+) -> anyhow::Result<()> {
+    cx.editor.last_selection.get_or_insert_with(|| {
+        let (view, doc) = current!(cx.editor);
+        doc.selection(view.id).clone()
+    });
+
+    let scrolloff = cx.editor.config().scrolloff;
+    let line = args[0].parse::<usize>()?;
+    goto_line_without_jumplist(cx.editor, NonZeroUsize::new(line));
+
+    let (view, doc) = current!(cx.editor);
+    view.ensure_cursor_in_view(doc, scrolloff);
+
     Ok(())
 }
 
@@ -1416,41 +1607,32 @@ pub(super) fn goto_line_number(
     event: PromptEvent,
 ) -> anyhow::Result<()> {
     match event {
-        PromptEvent::Abort => {
-            if let Some(line_number) = cx.editor.last_line_number {
-                goto_line_impl(cx.editor, NonZeroUsize::new(line_number));
-                let (view, doc) = current!(cx.editor);
-                view.ensure_cursor_in_view(doc, line_number);
-                cx.editor.last_line_number = None;
-            }
-            return Ok(());
-        }
+        PromptEvent::Abort => abort_goto_line_number_preview(cx),
         PromptEvent::Validate => {
             ensure!(!args.is_empty(), "Line number required");
-            cx.editor.last_line_number = None;
-        }
-        PromptEvent::Update => {
-            if args.is_empty() {
-                if let Some(line_number) = cx.editor.last_line_number {
-                    // When a user hits backspace and there are no numbers left,
-                    // we can bring them back to their original line
-                    goto_line_impl(cx.editor, NonZeroUsize::new(line_number));
-                    let (view, doc) = current!(cx.editor);
-                    view.ensure_cursor_in_view(doc, line_number);
-                    cx.editor.last_line_number = None;
-                }
-                return Ok(());
-            }
+
+            // If we are invoked directly via a keybinding, Validate is
+            // sent without any prior Update events. Ensure the cursor
+            // is moved to the appropriate location.
+            update_goto_line_number_preview(cx, args)?;
+
+            let last_selection = cx
+                .editor
+                .last_selection
+                .take()
+                .expect("update_goto_line_number_preview should always set last_selection");
+
             let (view, doc) = current!(cx.editor);
-            let text = doc.text().slice(..);
-            let line = doc.selection(view.id).primary().cursor_line(text);
-            cx.editor.last_line_number.get_or_insert(line + 1);
+            view.jumps.push((doc.id(), last_selection));
         }
+
+        // When a user hits backspace and there are no numbers left,
+        // we can bring them back to their original selection. If they
+        // begin typing numbers again, we'll start a new preview session.
+        PromptEvent::Update if args.is_empty() => abort_goto_line_number_preview(cx),
+        PromptEvent::Update => update_goto_line_number_preview(cx, args)?,
     }
-    let line = args[0].parse::<usize>()?;
-    goto_line_impl(cx.editor, NonZeroUsize::new(line));
-    let (view, doc) = current!(cx.editor);
-    view.ensure_cursor_in_view(doc, line);
+
     Ok(())
 }
 
@@ -1517,6 +1699,46 @@ fn set_option(
     Ok(())
 }
 
+/// Toggle boolean config option at runtime. Access nested values by dot
+/// syntax, for example to toggle smart case search, use `:toggle search.smart-
+/// case`.
+fn toggle_option(
+    cx: &mut compositor::Context,
+    args: &[Cow<str>],
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+
+    if args.len() != 1 {
+        anyhow::bail!("Bad arguments. Usage: `:toggle key`");
+    }
+    let key = &args[0].to_lowercase();
+
+    let key_error = || anyhow::anyhow!("Unknown key `{}`", key);
+
+    let mut config = serde_json::json!(&cx.editor.config().deref());
+    let pointer = format!("/{}", key.replace('.', "/"));
+    let value = config.pointer_mut(&pointer).ok_or_else(key_error)?;
+
+    if let Value::Bool(b) = *value {
+        *value = Value::Bool(!b);
+    } else {
+        anyhow::bail!("Key `{}` is not toggle-able", key)
+    }
+
+    // This unwrap should never fail because we only replace one boolean value
+    // with another, maintaining a valid json config
+    let config = serde_json::from_value(config).unwrap();
+
+    cx.editor
+        .config_events
+        .0
+        .send(ConfigEvent::Update(config))?;
+    Ok(())
+}
+
 /// Change the language of the current buffer at runtime.
 fn language(
     cx: &mut compositor::Context,
@@ -1527,13 +1749,20 @@ fn language(
         return Ok(());
     }
 
+    if args.is_empty() {
+        let doc = doc!(cx.editor);
+        let language = &doc.language_name().unwrap_or(DEFAULT_LANGUAGE_NAME);
+        cx.editor.set_status(language.to_string());
+        return Ok(());
+    }
+
     if args.len() != 1 {
         anyhow::bail!("Bad arguments. Usage: `:set-language language`");
     }
 
     let doc = doc_mut!(cx.editor);
 
-    if args[0] == "text" {
+    if args[0] == DEFAULT_LANGUAGE_NAME {
         doc.set_language(None, None)
     } else {
         doc.set_language_by_language_id(&args[0], cx.editor.syn_loader.clone())?;
@@ -1570,6 +1799,7 @@ fn sort_impl(
     _args: &[Cow<str>],
     reverse: bool,
 ) -> anyhow::Result<()> {
+    let scrolloff = cx.editor.config().scrolloff;
     let (view, doc) = current!(cx.editor);
     let text = doc.text().slice(..);
 
@@ -1595,6 +1825,7 @@ fn sort_impl(
 
     doc.apply(&transaction, view.id);
     doc.append_changes_to_history(view);
+    view.ensure_cursor_in_view(doc, scrolloff);
 
     Ok(())
 }
@@ -1609,30 +1840,26 @@ fn reflow(
     }
 
     let scrolloff = cx.editor.config().scrolloff;
+    let cfg_text_width: usize = cx.editor.config().text_width;
     let (view, doc) = current!(cx.editor);
 
-    const DEFAULT_MAX_LEN: usize = 79;
-
-    // Find the max line length by checking the following sources in order:
+    // Find the text_width by checking the following sources in order:
     //   - The passed argument in `args`
-    //   - The configured max_line_len for this language in languages.toml
-    //   - The const default we set above
-    let max_line_len: usize = args
+    //   - The configured text-width for this language in languages.toml
+    //   - The configured text-width in the config.toml
+    let text_width: usize = args
         .get(0)
         .map(|num| num.parse::<usize>())
         .transpose()?
-        .or_else(|| {
-            doc.language_config()
-                .and_then(|config| config.max_line_length)
-        })
-        .unwrap_or(DEFAULT_MAX_LEN);
+        .or_else(|| doc.language_config().and_then(|config| config.text_width))
+        .unwrap_or(cfg_text_width);
 
     let rope = doc.text();
 
     let selection = doc.selection(view.id);
     let transaction = Transaction::change_by_selection(rope, selection, |range| {
         let fragment = range.fragment(rope.slice(..));
-        let reflowed_text = helix_core::wrap::reflow_hard_wrap(&fragment, max_line_len);
+        let reflowed_text = helix_core::wrap::reflow_hard_wrap(&fragment, text_width);
 
         (range.from(), range.to(), Some(reflowed_text))
     });
@@ -1819,6 +2046,64 @@ fn run_shell_command(
         cx.jobs.callback(callback);
     }
 
+    Ok(())
+}
+
+fn reset_diff_change(
+    cx: &mut compositor::Context,
+    args: &[Cow<str>],
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    ensure!(args.is_empty(), ":reset-diff-change takes no arguments");
+
+    let editor = &mut cx.editor;
+    let scrolloff = editor.config().scrolloff;
+
+    let (view, doc) = current!(editor);
+    // TODO refactor to use let..else once MSRV is raised to 1.65
+    let handle = match doc.diff_handle() {
+        Some(handle) => handle,
+        None => bail!("Diff is not available in the current buffer"),
+    };
+
+    let diff = handle.load();
+    let doc_text = doc.text().slice(..);
+    let line = doc.selection(view.id).primary().cursor_line(doc_text);
+
+    // TODO refactor to use let..else once MSRV is raised to 1.65
+    let hunk_idx = match diff.hunk_at(line as u32, true) {
+        Some(hunk_idx) => hunk_idx,
+        None => bail!("There is no change at the cursor"),
+    };
+    let hunk = diff.nth_hunk(hunk_idx);
+    let diff_base = diff.diff_base();
+    let before_start = diff_base.line_to_char(hunk.before.start as usize);
+    let before_end = diff_base.line_to_char(hunk.before.end as usize);
+    let text: Tendril = diff
+        .diff_base()
+        .slice(before_start..before_end)
+        .chunks()
+        .collect();
+    let anchor = doc_text.line_to_char(hunk.after.start as usize);
+    let transaction = Transaction::change(
+        doc.text(),
+        [(
+            anchor,
+            doc_text.line_to_char(hunk.after.end as usize),
+            (!text.is_empty()).then_some(text),
+        )]
+        .into_iter(),
+    );
+    drop(diff); // make borrow check happy
+    doc.apply(&transaction, view.id);
+    // select inserted text
+    let text_len = before_end - before_start;
+    doc.set_selection(view.id, Selection::single(anchor, anchor + text_len));
+    doc.append_changes_to_history(view);
+    view.ensure_cursor_in_view(doc, scrolloff);
     Ok(())
 }
 
@@ -2128,6 +2413,13 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
             completer: None,
         },
         TypableCommand {
+            name: "character-info",
+            aliases: &["char"],
+            doc: "Get info about the character under the primary cursor.",
+            fun: get_character_info,
+            completer: None,
+        },
+        TypableCommand {
             name: "reload",
             aliases: &[],
             doc: "Discard changes and reload from the source file.",
@@ -2160,6 +2452,13 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
             aliases: &[],
             doc: "Restarts the Language Server that is in use by the current doc",
             fun: lsp_restart,
+            completer: None,
+        },
+        TypableCommand {
+            name: "lsp-stop",
+            aliases: &[],
+            doc: "Stops the Language Server that is in use by the current doc",
+            fun: lsp_stop,
             completer: None,
         },
         TypableCommand {
@@ -2235,7 +2534,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         TypableCommand {
             name: "set-language",
             aliases: &["lang"],
-            doc: "Set the language of current buffer.",
+            doc: "Set the language of current buffer (show current language if no value specified).",
             fun: language,
             completer: Some(completers::language),
         },
@@ -2244,6 +2543,13 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
             aliases: &["set"],
             doc: "Set a config option at runtime.\nFor example to disable smart case search, use `:set search.smart-case false`.",
             fun: set_option,
+            completer: Some(completers::setting),
+        },
+        TypableCommand {
+            name: "toggle-option",
+            aliases: &["toggle"],
+            doc: "Toggle a boolean config option at runtime.\nFor example to toggle smart case search, use `:toggle search.smart-case`.",
+            fun: toggle_option,
             completer: Some(completers::setting),
         },
         TypableCommand {
@@ -2336,6 +2642,13 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
             doc: "Run a shell command",
             fun: run_shell_command,
             completer: Some(completers::filename),
+        },
+       TypableCommand {
+            name: "reset-diff-change",
+            aliases: &["diffget", "diffg"],
+            doc: "Reset the diff change at the cursor position.",
+            fun: reset_diff_change,
+            completer: None,
         },
     ];
 

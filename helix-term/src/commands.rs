@@ -5,6 +5,7 @@ pub(crate) mod typed;
 pub use dap::*;
 use helix_vcs::Hunk;
 pub use lsp::*;
+use tokio::sync::oneshot;
 use tui::widgets::Row;
 pub use typed::*;
 
@@ -49,9 +50,13 @@ use movement::Movement;
 use crate::{
     args,
     compositor::{self, Component, Compositor},
+    filter_picker_entry,
     job::Callback,
     keymap::ReverseKeymap,
-    ui::{self, overlay::overlayed, FilePicker, Picker, Popup, Prompt, PromptEvent},
+    ui::{
+        self, editor::InsertEvent, overlay::overlayed, FilePicker, Picker, Popup, Prompt,
+        PromptEvent,
+    },
 };
 
 use crate::job::{self, Jobs};
@@ -72,13 +77,15 @@ use grep_searcher::{sinks, BinaryDetection, SearcherBuilder};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
+pub type OnKeyCallback = Box<dyn FnOnce(&mut Context, KeyEvent)>;
+
 pub struct Context<'a> {
     pub register: Option<char>,
     pub count: Option<NonZeroUsize>,
     pub editor: &'a mut Editor,
 
     pub callback: Option<crate::compositor::Callback>,
-    pub on_next_key_callback: Option<Box<dyn FnOnce(&mut Context, KeyEvent)>>,
+    pub on_next_key_callback: Option<OnKeyCallback>,
     pub jobs: &'a mut Jobs,
 }
 
@@ -107,17 +114,7 @@ impl<'a> Context<'a> {
         T: for<'de> serde::Deserialize<'de> + Send + 'static,
         F: FnOnce(&mut Editor, &mut Compositor, T) + Send + 'static,
     {
-        let callback = Box::pin(async move {
-            let json = call.await?;
-            let response = serde_json::from_value(json)?;
-            let call: job::Callback = Callback::EditorCompositor(Box::new(
-                move |editor: &mut Editor, compositor: &mut Compositor| {
-                    callback(editor, compositor, response)
-                },
-            ));
-            Ok(call)
-        });
-        self.jobs.callback(callback);
+        self.jobs.callback(make_job_callback(call, callback));
     }
 
     /// Returns 1 if no explicit count was provided
@@ -125,6 +122,27 @@ impl<'a> Context<'a> {
     pub fn count(&self) -> usize {
         self.count.map_or(1, |v| v.get())
     }
+}
+
+#[inline]
+fn make_job_callback<T, F>(
+    call: impl Future<Output = helix_lsp::Result<serde_json::Value>> + 'static + Send,
+    callback: F,
+) -> std::pin::Pin<Box<impl Future<Output = Result<Callback, anyhow::Error>>>>
+where
+    T: for<'de> serde::Deserialize<'de> + Send + 'static,
+    F: FnOnce(&mut Editor, &mut Compositor, T) + Send + 'static,
+{
+    Box::pin(async move {
+        let json = call.await?;
+        let response = serde_json::from_value(json)?;
+        let call: job::Callback = Callback::EditorCompositor(Box::new(
+            move |editor: &mut Editor, compositor: &mut Compositor| {
+                callback(editor, compositor, response)
+            },
+        ));
+        Ok(call)
+    })
 }
 
 use helix_view::{align_view, Align};
@@ -275,6 +293,7 @@ impl MappableCommand {
         append_mode, "Append after selection",
         command_mode, "Enter command mode",
         file_picker, "Open file picker",
+        file_picker_in_current_buffer_directory, "Open file picker at current buffers's directory",
         file_picker_in_current_directory, "Open file picker at current working directory",
         code_action, "Perform code action",
         buffer_picker, "Open buffer picker",
@@ -426,6 +445,7 @@ impl MappableCommand {
         goto_next_paragraph, "Goto next paragraph",
         goto_prev_paragraph, "Goto previous paragraph",
         dap_launch, "Launch debug target",
+        dap_restart, "Restart debugging session",
         dap_toggle_breakpoint, "Toggle breakpoint",
         dap_continue, "Continue program execution",
         dap_pause, "Pause program execution",
@@ -955,9 +975,10 @@ fn goto_window(cx: &mut Context, align: Align) {
         Align::Bottom => {
             view.offset.vertical_offset + last_visual_line.saturating_sub(scrolloff + count)
         }
-    }
-    .max(view.offset.vertical_offset + scrolloff)
-    .min(view.offset.vertical_offset + last_visual_line.saturating_sub(scrolloff));
+    };
+    let visual_line = visual_line
+        .max(view.offset.vertical_offset + scrolloff)
+        .min(view.offset.vertical_offset + last_visual_line.saturating_sub(scrolloff));
 
     let pos = view
         .pos_at_visual_coords(doc, visual_line as u16, 0, false)
@@ -1613,6 +1634,10 @@ fn copy_selection_on_line(cx: &mut Context, direction: Direction) {
                 sels += 1;
             }
 
+            if anchor_row == 0 && head_row == 0 {
+                break;
+            }
+
             i += 1;
         }
     }
@@ -2013,6 +2038,11 @@ fn global_search(cx: &mut Context) {
 
                 let search_root = std::env::current_dir()
                     .expect("Global search error: Failed to get current dir");
+                let dedup_symlinks = file_picker_config.deduplicate_links;
+                let absolute_root = search_root
+                    .canonicalize()
+                    .unwrap_or_else(|_| search_root.clone());
+
                 WalkBuilder::new(search_root)
                     .hidden(file_picker_config.hidden)
                     .parents(file_picker_config.parents)
@@ -2022,10 +2052,9 @@ fn global_search(cx: &mut Context) {
                     .git_global(file_picker_config.git_global)
                     .git_exclude(file_picker_config.git_exclude)
                     .max_depth(file_picker_config.max_depth)
-                    // We always want to ignore the .git directory, otherwise if
-                    // `ignore` is turned off above, we end up with a lot of noise
-                    // in our picker.
-                    .filter_entry(|entry| entry.file_name() != ".git")
+                    .filter_entry(move |entry| {
+                        filter_picker_entry(entry, &absolute_root, dedup_symlinks)
+                    })
                     .build_parallel()
                     .run(|| {
                         let mut searcher = searcher.clone();
@@ -2396,6 +2425,22 @@ fn file_picker(cx: &mut Context) {
     cx.push_layer(Box::new(overlayed(picker)));
 }
 
+fn file_picker_in_current_buffer_directory(cx: &mut Context) {
+    let doc_dir = doc!(cx.editor)
+        .path()
+        .and_then(|path| path.parent().map(|path| path.to_path_buf()));
+
+    let path = match doc_dir {
+        Some(path) => path,
+        None => {
+            cx.editor.set_error("current buffer has no path or parent");
+            return;
+        }
+    };
+
+    let picker = ui::file_picker(path, &cx.editor.config());
+    cx.push_layer(Box::new(overlayed(picker)));
+}
 fn file_picker_in_current_directory(cx: &mut Context) {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("./"));
     let picker = ui::file_picker(cwd, &cx.editor.config());
@@ -2426,20 +2471,15 @@ fn buffer_picker(cx: &mut Context) {
                 None => SCRATCH_BUFFER_NAME,
             };
 
-            let mut flags = Vec::new();
+            let mut flags = String::new();
             if self.is_modified {
-                flags.push("+");
+                flags.push('+');
             }
             if self.is_current {
-                flags.push("*");
+                flags.push('*');
             }
 
-            let flag = if flags.is_empty() {
-                "".into()
-            } else {
-                format!(" ({})", flags.join(""))
-            };
-            format!("{} {}{}", self.id, path, flag).into()
+            Row::new([self.id.to_string(), flags, path.to_string()])
         }
     }
 
@@ -2811,10 +2851,15 @@ fn push_jump(view: &mut View, doc: &Document) {
 }
 
 fn goto_line(cx: &mut Context) {
-    goto_line_impl(cx.editor, cx.count)
+    if cx.count.is_some() {
+        let (view, doc) = current!(cx.editor);
+        push_jump(view, doc);
+
+        goto_line_without_jumplist(cx.editor, cx.count);
+    }
 }
 
-fn goto_line_impl(editor: &mut Editor, count: Option<NonZeroUsize>) {
+fn goto_line_without_jumplist(editor: &mut Editor, count: Option<NonZeroUsize>) {
     if let Some(count) = count {
         let (view, doc) = current!(editor);
         let text = doc.text().slice(..);
@@ -2831,7 +2876,6 @@ fn goto_line_impl(editor: &mut Editor, count: Option<NonZeroUsize>) {
             .clone()
             .transform(|range| range.put_cursor(text, pos, editor.mode == Mode::Select));
 
-        push_jump(view, doc);
         doc.set_selection(view.id, selection);
     }
 }
@@ -2918,14 +2962,6 @@ fn exit_select_mode(cx: &mut Context) {
     }
 }
 
-fn goto_pos(editor: &mut Editor, pos: usize) {
-    let (view, doc) = current!(editor);
-
-    push_jump(view, doc);
-    doc.set_selection(view.id, Selection::point(pos));
-    align_view(doc, view, Align::Center);
-}
-
 fn goto_first_diag(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
     let selection = match doc.diagnostics().first() {
@@ -2933,7 +2969,6 @@ fn goto_first_diag(cx: &mut Context) {
         None => return,
     };
     doc.set_selection(view.id, selection);
-    align_view(doc, view, Align::Center);
 }
 
 fn goto_last_diag(cx: &mut Context) {
@@ -2943,7 +2978,6 @@ fn goto_last_diag(cx: &mut Context) {
         None => return,
     };
     doc.set_selection(view.id, selection);
-    align_view(doc, view, Align::Center);
 }
 
 fn goto_next_diag(cx: &mut Context) {
@@ -2965,7 +2999,6 @@ fn goto_next_diag(cx: &mut Context) {
         None => return,
     };
     doc.set_selection(view.id, selection);
-    align_view(doc, view, Align::Center);
 }
 
 fn goto_prev_diag(cx: &mut Context) {
@@ -2990,7 +3023,6 @@ fn goto_prev_diag(cx: &mut Context) {
         None => return,
     };
     doc.set_selection(view.id, selection);
-    align_view(doc, view, Align::Center);
 }
 
 fn goto_first_change(cx: &mut Context) {
@@ -3003,20 +3035,20 @@ fn goto_last_change(cx: &mut Context) {
 
 fn goto_first_change_impl(cx: &mut Context, reverse: bool) {
     let editor = &mut cx.editor;
-    let (_, doc) = current!(editor);
+    let (view, doc) = current!(editor);
     if let Some(handle) = doc.diff_handle() {
         let hunk = {
-            let hunks = handle.hunks();
+            let diff = handle.load();
             let idx = if reverse {
-                hunks.len().saturating_sub(1)
+                diff.len().saturating_sub(1)
             } else {
                 0
             };
-            hunks.nth_hunk(idx)
+            diff.nth_hunk(idx)
         };
         if hunk != Hunk::NONE {
-            let pos = doc.text().line_to_char(hunk.after.start as usize);
-            goto_pos(editor, pos)
+            let range = hunk_range(hunk, doc.text().slice(..));
+            doc.set_selection(view.id, Selection::single(range.anchor, range.head));
         }
     }
 }
@@ -3044,30 +3076,20 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
         let selection = doc.selection(view.id).clone().transform(|range| {
             let cursor_line = range.cursor_line(doc_text) as u32;
 
-            let hunks = diff_handle.hunks();
+            let diff = diff_handle.load();
             let hunk_idx = match direction {
-                Direction::Forward => hunks
+                Direction::Forward => diff
                     .next_hunk(cursor_line)
-                    .map(|idx| (idx + count).min(hunks.len() - 1)),
-                Direction::Backward => hunks
+                    .map(|idx| (idx + count).min(diff.len() - 1)),
+                Direction::Backward => diff
                     .prev_hunk(cursor_line)
                     .map(|idx| idx.saturating_sub(count)),
             };
-            // TODO refactor with let..else once MSRV reaches 1.65
-            let hunk_idx = if let Some(hunk_idx) = hunk_idx {
-                hunk_idx
-            } else {
+            let Some(hunk_idx) = hunk_idx else {
                 return range;
             };
-            let hunk = hunks.nth_hunk(hunk_idx);
-
-            let hunk_start = doc_text.line_to_char(hunk.after.start as usize);
-            let hunk_end = if hunk.after.is_empty() {
-                hunk_start + 1
-            } else {
-                doc_text.line_to_char(hunk.after.end as usize)
-            };
-            let new_range = Range::new(hunk_start, hunk_end);
+            let hunk = diff.nth_hunk(hunk_idx);
+            let new_range = hunk_range(hunk, doc_text);
             if editor.mode == Mode::Select {
                 let head = if new_range.head < range.anchor {
                     new_range.anchor
@@ -3085,6 +3107,20 @@ fn goto_next_change_impl(cx: &mut Context, direction: Direction) {
     };
     motion(cx.editor);
     cx.editor.last_motion = Some(Motion(Box::new(motion)));
+}
+
+/// Returns the [Range] for a [Hunk] in the given text.
+/// Additions and modifications cover the added and modified ranges.
+/// Deletions are represented as the point at the start of the deletion hunk.
+fn hunk_range(hunk: Hunk, text: RopeSlice) -> Range {
+    let anchor = text.line_to_char(hunk.after.start as usize);
+    let head = if hunk.after.is_empty() {
+        anchor + 1
+    } else {
+        text.line_to_char(hunk.after.end as usize)
+    };
+
+    Range::new(anchor, head)
 }
 
 pub mod insert {
@@ -3349,8 +3385,8 @@ pub mod insert {
         let count = cx.count();
         let (view, doc) = current_ref!(cx.editor);
         let text = doc.text().slice(..);
-        let indent_unit = doc.indent_style.as_str();
-        let tab_size = doc.tab_width();
+        let tab_width = doc.tab_width();
+        let indent_width = doc.indent_width();
         let auto_pairs = doc.auto_pairs(cx.editor);
 
         let transaction =
@@ -3371,18 +3407,11 @@ pub mod insert {
                             None,
                         )
                     } else {
-                        let unit_len = indent_unit.chars().count();
-                        // NOTE: indent_unit always contains 'only spaces' or 'only tab' according to `IndentStyle` definition.
-                        let unit_size = if indent_unit.starts_with('\t') {
-                            tab_size * unit_len
-                        } else {
-                            unit_len
-                        };
                         let width: usize = fragment
                             .chars()
                             .map(|ch| {
                                 if ch == '\t' {
-                                    tab_size
+                                    tab_width
                                 } else {
                                     // it can be none if it still meet control characters other than '\t'
                                     // here just set the width to 1 (or some value better?).
@@ -3390,9 +3419,9 @@ pub mod insert {
                                 }
                             })
                             .sum();
-                        let mut drop = width % unit_size; // round down to nearest unit
+                        let mut drop = width % indent_width; // round down to nearest unit
                         if drop == 0 {
-                            drop = unit_size
+                            drop = indent_width
                         }; // if it's already at a unit, consume a whole unit
                         let mut chars = fragment.chars().rev();
                         let mut start = pos;
@@ -3737,6 +3766,7 @@ fn paste_impl(
     }
 
     doc.apply(&transaction, view.id);
+    doc.append_changes_to_history(view);
 }
 
 pub(crate) fn paste_bracketed_value(cx: &mut Context, contents: String) {
@@ -3933,7 +3963,7 @@ fn unindent(cx: &mut Context) {
     let lines = get_lines(doc, view.id);
     let mut changes = Vec::with_capacity(lines.len());
     let tab_width = doc.tab_width();
-    let indent_width = count * tab_width;
+    let indent_width = count * doc.indent_width();
 
     for line_idx in lines {
         let line = doc.text().line(line_idx);
@@ -4164,6 +4194,24 @@ pub fn completion(cx: &mut Context) {
         None => return,
     };
 
+    // setup a chanel that allows the request to be canceled
+    let (tx, rx) = oneshot::channel();
+    // set completion_request so that this request can be canceled
+    // by setting completion_request, the old channel stored there is dropped
+    // and the associated request is automatically dropped
+    cx.editor.completion_request_handle = Some(tx);
+    let future = async move {
+        tokio::select! {
+            biased;
+            _ = rx => {
+                Ok(serde_json::Value::Null)
+            }
+            res = future => {
+                res
+            }
+        }
+    };
+
     let trigger_offset = cursor;
 
     // TODO: trigger_offset should be the cursor offset but we also need a starting offset from where we want to apply
@@ -4174,12 +4222,35 @@ pub fn completion(cx: &mut Context) {
     iter.reverse();
     let offset = iter.take_while(|ch| chars::char_is_word(*ch)).count();
     let start_offset = cursor.saturating_sub(offset);
+    let savepoint = doc.savepoint(view);
+
+    let trigger_doc = doc.id();
+    let trigger_view = view.id;
+
+    // FIXME: The commands Context can only have a single callback
+    // which means it gets overwritten when executing keybindings
+    // with multiple commands or macros. This would mean that completion
+    // might be incorrectly applied when repeating the insertmode action
+    //
+    // TODO: to solve this either make cx.callback a Vec of callbacks or
+    // alternatively move `last_insert` to `helix_view::Editor`
+    cx.callback = Some(Box::new(
+        move |compositor: &mut Compositor, _cx: &mut compositor::Context| {
+            let ui = compositor.find::<ui::EditorView>().unwrap();
+            ui.last_insert.1.push(InsertEvent::RequestCompletion);
+        },
+    ));
 
     cx.callback(
         future,
         move |editor, compositor, response: Option<lsp::CompletionResponse>| {
-            if editor.mode != Mode::Insert {
-                // we're not in insert mode anymore
+            let (view, doc) = current_ref!(editor);
+            // check if the completion request is stale.
+            //
+            // Completions are completed asynchrounsly and therefore the user could
+            //switch document/view or leave insert mode. In all of thoise cases the
+            // completion should be discarded
+            if editor.mode != Mode::Insert || view.id != trigger_view || doc.id() != trigger_doc {
                 return;
             }
 
@@ -4201,6 +4272,7 @@ pub fn completion(cx: &mut Context) {
             let ui = compositor.find::<ui::EditorView>().unwrap();
             ui.set_completion(
                 editor,
+                savepoint,
                 items,
                 offset_encoding,
                 start_offset,
@@ -4318,7 +4390,6 @@ fn shrink_selection(cx: &mut Context) {
         // try to restore previous selection
         if let Some(prev_selection) = view.object_selections.pop() {
             if current_selection.contains(&prev_selection) {
-                // allow shrinking the selection only if current selection contains the previous object selection
                 doc.set_selection(view.id, prev_selection);
                 return;
             } else {
@@ -4718,14 +4789,14 @@ fn select_textobject(cx: &mut Context, objtype: textobject::TextObject) {
 
                 let textobject_change = |range: Range| -> Range {
                     let diff_handle = doc.diff_handle().unwrap();
-                    let hunks = diff_handle.hunks();
+                    let diff = diff_handle.load();
                     let line = range.cursor_line(text);
-                    let hunk_idx = if let Some(hunk_idx) = hunks.hunk_at(line as u32, false) {
+                    let hunk_idx = if let Some(hunk_idx) = diff.hunk_at(line as u32, false) {
                         hunk_idx
                     } else {
                         return range;
                     };
-                    let hunk = hunks.nth_hunk(hunk_idx).after;
+                    let hunk = diff.nth_hunk(hunk_idx).after;
 
                     let start = text.line_to_char(hunk.start as usize);
                     let end = text.line_to_char(hunk.end as usize);
@@ -4774,7 +4845,7 @@ fn select_textobject(cx: &mut Context, objtype: textobject::TextObject) {
         ("a", "Argument/parameter (tree-sitter)"),
         ("c", "Comment (tree-sitter)"),
         ("T", "Test (tree-sitter)"),
-        ("m", "Closest surrounding pair to cursor"),
+        ("m", "Closest surrounding pair"),
         (" ", "... or any character acting as a pair"),
     ];
 
@@ -4783,35 +4854,39 @@ fn select_textobject(cx: &mut Context, objtype: textobject::TextObject) {
 
 fn surround_add(cx: &mut Context) {
     cx.on_next_key(move |cx, event| {
-        let ch = match event.char() {
-            Some(ch) => ch,
+        let (view, doc) = current!(cx.editor);
+        // surround_len is the number of new characters being added.
+        let (open, close, surround_len) = match event.char() {
+            Some(ch) => {
+                let (o, c) = surround::get_pair(ch);
+                let mut open = Tendril::new();
+                open.push(o);
+                let mut close = Tendril::new();
+                close.push(c);
+                (open, close, 2)
+            }
+            None if event.code == KeyCode::Enter => (
+                doc.line_ending.as_str().into(),
+                doc.line_ending.as_str().into(),
+                2 * doc.line_ending.len_chars(),
+            ),
             None => return,
         };
-        let (view, doc) = current!(cx.editor);
-        let selection = doc.selection(view.id);
-        let (open, close) = surround::get_pair(ch);
-        // The number of chars in get_pair
-        let surround_len = 2;
 
+        let selection = doc.selection(view.id);
         let mut changes = Vec::with_capacity(selection.len() * 2);
         let mut ranges = SmallVec::with_capacity(selection.len());
         let mut offs = 0;
 
         for range in selection.iter() {
-            let mut o = Tendril::new();
-            o.push(open);
-            let mut c = Tendril::new();
-            c.push(close);
-            changes.push((range.from(), range.from(), Some(o)));
-            changes.push((range.to(), range.to(), Some(c)));
+            changes.push((range.from(), range.from(), Some(open.clone())));
+            changes.push((range.to(), range.to(), Some(close.clone())));
 
-            // Add 2 characters to the range to select them
             ranges.push(
                 Range::new(offs + range.from(), offs + range.to() + surround_len)
                     .with_direction(range.direction()),
             );
 
-            // Add 2 characters to the offset for the next ranges
             offs += surround_len;
         }
 
@@ -5022,7 +5097,10 @@ async fn shell_impl_async(
             log::error!("Shell error: {}", err);
             bail!("Shell error: {}", err);
         }
-        bail!("Shell command failed");
+        match output.status.code() {
+            Some(exit_code) => bail!("Shell command failed: status {}", exit_code),
+            None => bail!("Shell command failed"),
+        }
     } else if !output.stderr.is_empty() {
         log::debug!(
             "Command printed to stderr: {}",

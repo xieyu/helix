@@ -70,6 +70,8 @@ impl From<DocumentId> for PathOrId {
     }
 }
 
+type FileCallback<T> = Box<dyn Fn(&Editor, &T) -> Option<FileLocation>>;
+
 /// File path and range of lines (used to align and highlight lines)
 pub type FileLocation = (PathOrId, Option<(usize, usize)>);
 
@@ -80,7 +82,7 @@ pub struct FilePicker<T: Item> {
     preview_cache: HashMap<PathBuf, CachedPreview>,
     read_buffer: Vec<u8>,
     /// Given an item in the picker, return the file path and line number to display.
-    file_fn: Box<dyn Fn(&Editor, &T) -> Option<FileLocation>>,
+    file_fn: FileCallback<T>,
 }
 
 pub enum CachedPreview {
@@ -223,6 +225,9 @@ impl<T: Item> FilePicker<T> {
                 let loader = cx.editor.syn_loader.clone();
                 doc.detect_language(loader);
             }
+
+            // QUESTION: do we want to compute inlay hints in pickers too ? Probably not for now
+            // but it could be interesting in the future
         }
 
         EventResult::Consumed(None)
@@ -337,6 +342,7 @@ impl<T: Item + 'static> Component for FilePicker<T> {
                 inner,
                 doc,
                 offset,
+                // TODO: compute text annotations asynchronously here (like inlay hints)
                 &TextAnnotations::default(),
                 highlights,
                 &cx.editor.theme,
@@ -394,6 +400,8 @@ impl Ord for PickerMatch {
     }
 }
 
+type PickerCallback<T> = Box<dyn Fn(&mut Context, &T, Action)>;
+
 pub struct Picker<T: Item> {
     options: Vec<T>,
     editor_data: T::Data,
@@ -407,7 +415,7 @@ pub struct Picker<T: Item> {
     cursor: usize,
     // pattern: String,
     prompt: Prompt,
-    previous_pattern: String,
+    previous_pattern: (String, FuzzyQuery),
     /// Whether to truncate the start (default true)
     pub truncate_start: bool,
     /// Whether to show the preview panel (default true)
@@ -415,7 +423,7 @@ pub struct Picker<T: Item> {
     /// Constraints for tabular formatting
     widths: Vec<Constraint>,
 
-    callback_fn: Box<dyn Fn(&mut Context, &T, Action)>,
+    callback_fn: PickerCallback<T>,
 }
 
 impl<T: Item> Picker<T> {
@@ -431,26 +439,6 @@ impl<T: Item> Picker<T> {
             |_editor: &mut Context, _pattern: &str, _event: PromptEvent| {},
         );
 
-        let n = options
-            .first()
-            .map(|option| option.format(&editor_data).cells.len())
-            .unwrap_or_default();
-        let max_lens = options.iter().fold(vec![0; n], |mut acc, option| {
-            let row = option.format(&editor_data);
-            // maintain max for each column
-            for (acc, cell) in acc.iter_mut().zip(row.cells.iter()) {
-                let width = cell.content.width();
-                if width > *acc {
-                    *acc = width;
-                }
-            }
-            acc
-        });
-        let widths = max_lens
-            .into_iter()
-            .map(|len| Constraint::Length(len as u16))
-            .collect();
-
         let mut picker = Self {
             options,
             editor_data,
@@ -458,15 +446,17 @@ impl<T: Item> Picker<T> {
             matches: Vec::new(),
             cursor: 0,
             prompt,
-            previous_pattern: String::new(),
+            previous_pattern: (String::new(), FuzzyQuery::default()),
             truncate_start: true,
             show_preview: true,
             callback_fn: Box::new(callback_fn),
             completion_height: 0,
-            widths,
+            widths: Vec::new(),
         };
 
-        // scoring on empty input:
+        picker.calculate_column_widths();
+
+        // scoring on empty input
         // TODO: just reuse score()
         picker
             .matches
@@ -482,12 +472,49 @@ impl<T: Item> Picker<T> {
         picker
     }
 
+    pub fn set_options(&mut self, new_options: Vec<T>) {
+        self.options = new_options;
+        self.cursor = 0;
+        self.force_score();
+        self.calculate_column_widths();
+    }
+
+    /// Calculate the width constraints using the maximum widths of each column
+    /// for the current options.
+    fn calculate_column_widths(&mut self) {
+        let n = self
+            .options
+            .first()
+            .map(|option| option.format(&self.editor_data).cells.len())
+            .unwrap_or_default();
+        let max_lens = self.options.iter().fold(vec![0; n], |mut acc, option| {
+            let row = option.format(&self.editor_data);
+            // maintain max for each column
+            for (acc, cell) in acc.iter_mut().zip(row.cells.iter()) {
+                let width = cell.content.width();
+                if width > *acc {
+                    *acc = width;
+                }
+            }
+            acc
+        });
+        self.widths = max_lens
+            .into_iter()
+            .map(|len| Constraint::Length(len as u16))
+            .collect();
+    }
+
     pub fn score(&mut self) {
         let pattern = self.prompt.line();
 
-        if pattern == &self.previous_pattern {
+        if pattern == &self.previous_pattern.0 {
             return;
         }
+
+        let (query, is_refined) = self
+            .previous_pattern
+            .1
+            .refine(pattern, &self.previous_pattern.0);
 
         if pattern.is_empty() {
             // Fast path for no pattern.
@@ -501,8 +528,7 @@ impl<T: Item> Picker<T> {
                         len: text.chars().count(),
                     }
                 }));
-        } else if pattern.starts_with(&self.previous_pattern) {
-            let query = FuzzyQuery::new(pattern);
+        } else if is_refined {
             // optimization: if the pattern is a more specific version of the previous one
             // then we can score the filtered set.
             self.matches.retain_mut(|pmatch| {
@@ -527,7 +553,8 @@ impl<T: Item> Picker<T> {
         // reset cursor position
         self.cursor = 0;
         let pattern = self.prompt.line();
-        self.previous_pattern.clone_from(pattern);
+        self.previous_pattern.0.clone_from(pattern);
+        self.previous_pattern.1 = query;
     }
 
     pub fn force_score(&mut self) {
@@ -922,9 +949,7 @@ impl<T: Item + Send + 'static> Component for DynamicPicker<T> {
                         Some(overlay) => &mut overlay.content.file_picker.picker,
                         None => return,
                     };
-                    picker.options = new_options;
-                    picker.cursor = 0;
-                    picker.force_score();
+                    picker.set_options(new_options);
                     editor.reset_idle_timer();
                 }));
             anyhow::Ok(callback)
