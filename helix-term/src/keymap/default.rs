@@ -274,6 +274,7 @@ pub fn default() -> HashMap<Mode, Keymap> {
             "r" => rename_symbol,
             "h" => select_references_to_symbol_under_cursor,
             "?" => command_palette,
+            "e" => reveal_current_file,
         },
         "z" => { "View"
             "z" | "c" => align_view_center,

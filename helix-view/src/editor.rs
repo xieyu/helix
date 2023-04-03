@@ -214,6 +214,7 @@ impl Default for FilePickerConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+<<<<<<< HEAD
 pub struct IconsConfig {
     /// Enables icons in front of buffer names in bufferline. Defaults to `true`
     pub bufferline: bool,
@@ -232,6 +233,28 @@ impl Default for IconsConfig {
         }
     }
 }
+pub struct ExplorerConfig {
+    pub position: ExplorerPosition,
+    /// explorer column width
+    pub column_width: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExplorerPosition {
+    Left,
+    Right,
+}
+
+impl Default for ExplorerConfig {
+    fn default() -> Self {
+        Self {
+            position: ExplorerPosition::Left,
+            column_width: 36,
+        }
+    }
+}
+
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
@@ -303,6 +326,8 @@ pub struct Config {
     pub indent_guides: IndentGuidesConfig,
     /// Whether to color modes with different colors. Defaults to `false`.
     pub color_modes: bool,
+    /// explore config
+    pub explorer: ExplorerConfig,
     pub soft_wrap: SoftWrap,
     /// Workspace specific lsp ceiling dirs
     pub workspace_lsp_roots: Vec<PathBuf>,
@@ -776,6 +801,7 @@ impl Default for Config {
             bufferline: BufferLine::default(),
             indent_guides: IndentGuidesConfig::default(),
             color_modes: false,
+            explorer: ExplorerConfig::default(),
             soft_wrap: SoftWrap::default(),
             text_width: 80,
             completion_replace: false,
@@ -951,6 +977,18 @@ pub enum CloseError {
     BufferModified(String),
     /// Document failed to save
     SaveError(anyhow::Error),
+}
+
+impl From<CloseError> for anyhow::Error {
+    fn from(error: CloseError) -> Self {
+        match error {
+            CloseError::DoesNotExist => anyhow::anyhow!("Document doesn't exist"),
+            CloseError::BufferModified(error) => {
+                anyhow::anyhow!(format!("Buffer modified: '{error}'"))
+            }
+            CloseError::SaveError(error) => anyhow::anyhow!(format!("Save error: {error}")),
+        }
+    }
 }
 
 impl Editor {

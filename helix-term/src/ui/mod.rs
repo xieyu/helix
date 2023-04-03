@@ -1,6 +1,7 @@
 mod completion;
 mod document;
 pub(crate) mod editor;
+mod explorer;
 mod fuzzy_match;
 mod info;
 pub mod lsp;
@@ -13,6 +14,7 @@ mod prompt;
 mod spinner;
 mod statusline;
 mod text;
+mod tree;
 
 use crate::compositor::{Component, Compositor};
 use crate::filter_picker_entry;
@@ -20,6 +22,7 @@ use crate::job::{self, Callback};
 pub use completion::Completion;
 pub use editor::EditorView;
 use helix_view::icons::Icons;
+pub use explorer::Explorer;
 pub use markdown::Markdown;
 pub use menu::Menu;
 pub use picker::{DynamicPicker, FileLocation, FilePicker, Picker};
@@ -27,6 +30,7 @@ pub use popup::Popup;
 pub use prompt::{Prompt, PromptEvent};
 pub use spinner::{ProgressSpinners, Spinner};
 pub use text::Text;
+pub use tree::{TreeOp, TreeView, TreeViewItem};
 
 use helix_core::regex::Regex;
 use helix_core::regex::RegexBuilder;
