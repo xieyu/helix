@@ -214,7 +214,6 @@ impl Default for FilePickerConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
-<<<<<<< HEAD
 pub struct IconsConfig {
     /// Enables icons in front of buffer names in bufferline. Defaults to `true`
     pub bufferline: bool,
@@ -233,6 +232,9 @@ impl Default for IconsConfig {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct ExplorerConfig {
     pub position: ExplorerPosition,
     /// explorer column width
@@ -254,7 +256,6 @@ impl Default for ExplorerConfig {
         }
     }
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
