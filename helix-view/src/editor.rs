@@ -40,6 +40,7 @@ use tokio::{
 
 use anyhow::{anyhow, bail, Error};
 
+use crate::words_completion::WordsCompletion;
 pub use helix_core::diagnostic::Severity;
 pub use helix_core::register::Registers;
 use helix_core::{
@@ -906,6 +907,8 @@ pub struct Editor {
     pub exit_code: i32,
 
     pub config_events: (UnboundedSender<ConfigEvent>, UnboundedReceiver<ConfigEvent>),
+    pub words_completion: Arc<WordsCompletion>,
+
     /// Allows asynchronous tasks to control the rendering
     /// The `Notify` allows asynchronous tasks to request the editor to perform a redraw
     /// The `RwLock` blocks the editor from performing the render until an exclusive lock can be aquired
@@ -1042,6 +1045,7 @@ impl Editor {
             auto_pairs,
             exit_code: 0,
             config_events: unbounded_channel(),
+            words_completion: Arc::new(WordsCompletion::new(conf.completion_trigger_len)),
             redraw_handle: Default::default(),
             needs_redraw: false,
             cursor_cache: Cell::new(None),
@@ -1356,6 +1360,7 @@ impl Editor {
         self.next_document_id =
             DocumentId(unsafe { NonZeroUsize::new_unchecked(self.next_document_id.0.get() + 1) });
         doc.id = id;
+
         self.documents.insert(id, doc);
 
         let (save_sender, save_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -1374,14 +1379,22 @@ impl Editor {
     }
 
     pub fn new_file(&mut self, action: Action) -> DocumentId {
-        self.new_file_from_document(action, Document::default(self.config.clone()))
+        self.new_file_from_document(
+            action,
+            Document::default(self.config.clone(), Some(self.words_completion.clone())),
+        )
     }
 
     pub fn new_file_from_stdin(&mut self, action: Action) -> Result<DocumentId, Error> {
         let (rope, encoding) = crate::document::from_reader(&mut stdin(), None)?;
         Ok(self.new_file_from_document(
             action,
-            Document::from(rope, Some(encoding), self.config.clone()),
+            Document::from(
+                rope,
+                Some(encoding),
+                self.config.clone(),
+                Some(self.words_completion.clone()),
+            ),
         ))
     }
 
@@ -1398,6 +1411,7 @@ impl Editor {
                 None,
                 Some(self.syn_loader.clone()),
                 self.config.clone(),
+                Some(self.words_completion.clone()),
             )?;
 
             if let Some(diff_base) = self.diff_providers.get_diff_base(&path) {
@@ -1488,7 +1502,12 @@ impl Editor {
                 .iter()
                 .map(|(&doc_id, _)| doc_id)
                 .next()
-                .unwrap_or_else(|| self.new_document(Document::default(self.config.clone())));
+                .unwrap_or_else(|| {
+                    self.new_document(Document::default(
+                        self.config.clone(),
+                        Some(self.words_completion.clone()),
+                    ))
+                });
             let view = View::new(doc_id, self.config().gutters.clone());
             let view_id = self.tree.insert(view);
             let doc = doc_mut!(self, &doc_id);

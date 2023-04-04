@@ -61,7 +61,7 @@ use crate::{
 };
 
 use crate::job::{self, Jobs};
-use futures_util::StreamExt;
+use futures_util::{future, FutureExt, StreamExt};
 use std::{collections::HashMap, fmt, future::Future};
 use std::{collections::HashSet, num::NonZeroUsize};
 
@@ -77,6 +77,27 @@ use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{sinks, BinaryDetection, SearcherBuilder};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 use tokio_stream::wrappers::UnboundedReceiverStream;
+
+// TODO use Either?
+pub enum CompletionResult {
+    LanguageServer(helix_lsp::Result<serde_json::Value>),
+    WordsCompletionResult(Option<Vec<String>>),
+}
+
+impl CompletionResult {
+    pub fn from_ls(self) -> helix_lsp::Result<serde_json::Value> {
+        match self {
+            CompletionResult::LanguageServer(v) => v,
+            _ => unreachable!(),
+        }
+    }
+    pub fn from_words_completion(self) -> Option<Vec<String>> {
+        match self {
+            CompletionResult::WordsCompletionResult(v) => v,
+            _ => unreachable!(),
+        }
+    }
+}
 
 pub type OnKeyCallback = Box<dyn FnOnce(&mut Context, KeyEvent)>;
 
@@ -116,6 +137,43 @@ impl<'a> Context<'a> {
         F: FnOnce(&mut Editor, &mut Compositor, T) + Send + 'static,
     {
         self.jobs.callback(make_job_callback(call, callback));
+    }
+
+    pub fn callback_completion_with_words<T, F>(
+        &mut self,
+        // call: impl Future<Output = (helix_lsp::Result<serde_json::Value>, Option<Vec<String>>)>
+        call: impl Future<Output = (CompletionResult, CompletionResult)> + 'static + Send,
+        callback: F,
+    ) where
+        T: for<'de> serde::Deserialize<'de> + Send + 'static,
+        F: FnOnce(&mut Editor, &mut Compositor, Option<T>, Option<Vec<String>>) + Send + 'static,
+    {
+        let callback = Box::pin(async move {
+            let (ls_result, words) = call.await;
+
+            let call: job::Callback = job::Callback::EditorCompositor(Box::new(
+                move |editor: &mut Editor, compositor: &mut Compositor| {
+                    let response = match ls_result.from_ls() {
+                        Ok(json) => match serde_json::from_value(json) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                log::error!("On parse LS response: {}", e);
+                                None
+                            }
+                        },
+                        Err(e) => {
+                            editor.set_error(format!("{}", e));
+                            None
+                        }
+                    };
+
+                    let words = words.from_words_completion();
+                    callback(editor, compositor, response, words)
+                },
+            ));
+            Ok(call)
+        });
+        self.jobs.callback(callback);
     }
 
     /// Returns 1 if no explicit count was provided
@@ -3295,6 +3353,77 @@ pub mod insert {
         }
     }
 
+    fn words_completion(cx: &mut Context, _ch: char) {
+        let config = cx.editor.config();
+        let (view, doc) = current!(cx.editor);
+
+        // skip for docs with language server
+        if doc.language_server().is_some() {
+            return;
+        }
+
+        let text = doc.text().slice(..);
+        let cursor = doc.selection(view.id).primary().cursor(text);
+
+        use helix_core::chars;
+        let mut iter = text.chars_at(cursor);
+        iter.reverse();
+        let offset = iter.take_while(|ch| chars::char_is_word(*ch)).count();
+        let start_offset = cursor.saturating_sub(offset);
+        let trigger_offset = cursor;
+
+        if cursor == start_offset {
+            return;
+        }
+
+        if cursor - start_offset < config.completion_trigger_len as usize {
+            return;
+        }
+
+        let prefix = text.slice(start_offset..cursor).to_string();
+
+        let words_completion = cx.editor.words_completion.clone();
+
+        let savepoint = doc.savepoint(view);
+        let callback = Box::pin(async move {
+            let items = words_completion.completion(prefix).await;
+
+            let call: job::Callback = job::Callback::EditorCompositor(Box::new(
+                move |editor: &mut Editor, compositor: &mut Compositor| {
+                    if editor.mode != Mode::Insert {
+                        // we're not in insert mode anymore
+                        return;
+                    }
+
+                    if let Some(items) = items {
+                        let items = items
+                            .into_iter()
+                            .map(|word| helix_lsp::lsp::CompletionItem {
+                                label: word,
+                                ..Default::default()
+                            })
+                            .collect::<Vec<_>>();
+
+                        let size = compositor.size();
+
+                        let ui = compositor.find::<ui::EditorView>().unwrap();
+                        ui.set_completion(
+                            editor,
+                            savepoint,
+                            items,
+                            helix_lsp::OffsetEncoding::Utf8,
+                            start_offset,
+                            trigger_offset,
+                            size,
+                        );
+                    }
+                },
+            ));
+            Ok(call)
+        });
+        cx.jobs.callback(callback);
+    }
+
     // The default insert hook: simply insert the character
     #[allow(clippy::unnecessary_wraps)] // need to use Option<> because of the Hook signature
     fn insert(doc: &Rope, selection: &Selection, ch: char) -> Option<Transaction> {
@@ -3326,7 +3455,7 @@ pub mod insert {
         // TODO: need a post insert hook too for certain triggers (autocomplete, signature help, etc)
         // this could also generically look at Transaction, but it's a bit annoying to look at
         // Operation instead of Change.
-        for hook in &[language_server_completion, signature_help] {
+        for hook in &[language_server_completion, signature_help, words_completion] {
             hook(cx, c);
         }
     }
@@ -4242,6 +4371,51 @@ fn remove_primary_selection(cx: &mut Context) {
     doc.set_selection(view.id, selection);
 }
 
+fn merge_words_to_lsp_completion(
+    words: Vec<String>,
+    mut items: Vec<helix_lsp::lsp::CompletionItem>,
+) -> Vec<helix_lsp::lsp::CompletionItem> {
+    // TODO get completion items len from config
+    const MAX_COMPLETION_ITEMS_LEN: usize = 20;
+
+    if items.len() >= MAX_COMPLETION_ITEMS_LEN {
+        return items;
+    }
+
+    // collect lsp completion options
+    let in_suggest: std::collections::HashSet<&str> = items
+        .iter()
+        .map(|i| {
+            match (&i.insert_text, &i.filter_text) {
+                (Some(text), _) => text,
+                (_, Some(text)) => text,
+                _ => &i.label,
+            }
+            .as_str()
+        })
+        .collect();
+
+    // build completion items and exclude words already in lsp completions options
+    let words = words
+        .into_iter()
+        .filter_map(|word| {
+            if in_suggest.contains(word.as_str()) {
+                None
+            } else {
+                Some(helix_lsp::lsp::CompletionItem {
+                    label: word,
+                    ..Default::default()
+                })
+            }
+        })
+        .take(MAX_COMPLETION_ITEMS_LEN - items.len())
+        .collect::<Vec<_>>();
+
+    items.extend(words);
+
+    items
+}
+
 pub fn completion(cx: &mut Context) {
     use helix_lsp::{lsp, util::pos_to_lsp_pos};
 
@@ -4259,7 +4433,7 @@ pub fn completion(cx: &mut Context) {
     let pos = pos_to_lsp_pos(doc.text(), cursor, offset_encoding);
 
     let future = match language_server.completion(doc.identifier(), pos, None) {
-        Some(future) => future,
+        Some(future) => future.map(CompletionResult::LanguageServer),
         None => return,
     };
 
@@ -4273,7 +4447,7 @@ pub fn completion(cx: &mut Context) {
         tokio::select! {
             biased;
             _ = rx => {
-                Ok(serde_json::Value::Null)
+                CompletionResult::LanguageServer(Ok(serde_json::Value::Null))
             }
             res = future => {
                 res
@@ -4291,6 +4465,16 @@ pub fn completion(cx: &mut Context) {
     iter.reverse();
     let offset = iter.take_while(|ch| chars::char_is_word(*ch)).count();
     let start_offset = cursor.saturating_sub(offset);
+    let prefix = text.slice(start_offset..cursor).to_string();
+
+    let words_completion = cx.editor.words_completion.clone();
+    let words_future = async move {
+        words_completion
+            .completion(prefix)
+            .map(CompletionResult::WordsCompletionResult)
+            .await
+    };
+
     let savepoint = doc.savepoint(view);
 
     let trigger_doc = doc.id();
@@ -4310,9 +4494,9 @@ pub fn completion(cx: &mut Context) {
         },
     ));
 
-    cx.callback(
-        future,
-        move |editor, compositor, response: Option<lsp::CompletionResponse>| {
+    cx.callback_completion_with_words(
+        future::join(future, words_future),
+        move |editor, compositor, response: Option<lsp::CompletionResponse>, words| {
             let (view, doc) = current_ref!(editor);
             // check if the completion request is stale.
             //
@@ -4323,7 +4507,7 @@ pub fn completion(cx: &mut Context) {
                 return;
             }
 
-            let items = match response {
+            let mut items = match response {
                 Some(lsp::CompletionResponse::Array(items)) => items,
                 // TODO: do something with is_incomplete
                 Some(lsp::CompletionResponse::List(lsp::CompletionList {
@@ -4332,6 +4516,11 @@ pub fn completion(cx: &mut Context) {
                 })) => items,
                 None => Vec::new(),
             };
+
+            // inject completions by words
+            if let Some(words) = words {
+                items = merge_words_to_lsp_completion(words, items);
+            }
 
             if items.is_empty() {
                 // editor.set_error("No completion available");

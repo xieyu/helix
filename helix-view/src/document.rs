@@ -24,6 +24,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 
+use crate::words_completion::{WordsCompletion, CHANGED_LINES_TO_PROCESS_WHOLE_DOC};
 use helix_core::{
     encoding,
     history::{History, State, UndoKind},
@@ -167,6 +168,8 @@ pub struct Document {
     diagnostics: Vec<Diagnostic>,
     language_server: Option<Arc<helix_lsp::Client>>,
 
+    // for completion
+    words_completion: Option<Arc<WordsCompletion>>,
     diff_handle: Option<DiffHandle>,
     version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
 }
@@ -465,6 +468,7 @@ impl Document {
         text: Rope,
         encoding: Option<&'static encoding::Encoding>,
         config: Arc<dyn DynAccess<Config>>,
+        words_completion: Option<Arc<WordsCompletion>>,
     ) -> Self {
         let encoding = encoding.unwrap_or(encoding::UTF_8);
         let changes = ChangeSet::new(&text);
@@ -495,13 +499,26 @@ impl Document {
             language_server: None,
             diff_handle: None,
             config,
+            words_completion,
             version_control_head: None,
         }
     }
-    pub fn default(config: Arc<dyn DynAccess<Config>>) -> Self {
+
+    // pub fn new(words_completion: Option<Arc<WordsCompletion>>) -> Self {
+    //     Document {
+    //         words_completion,
+    //         ..Default::default()
+    //     }
+    // }
+
+    pub fn default(
+        config: Arc<dyn DynAccess<Config>>,
+        words_completion: Option<Arc<WordsCompletion>>,
+    ) -> Self {
         let text = Rope::from(DEFAULT_LINE_ENDING.as_str());
-        Self::from(text, None, config)
+        Self::from(text, None, config, words_completion)
     }
+
     // TODO: async fn?
     /// Create a new document from `path`. Encoding is auto-detected, but it can be manually
     /// overwritten with the `encoding` parameter.
@@ -510,6 +527,7 @@ impl Document {
         encoding: Option<&'static encoding::Encoding>,
         config_loader: Option<Arc<syntax::Loader>>,
         config: Arc<dyn DynAccess<Config>>,
+        words_completion: Option<Arc<WordsCompletion>>,
     ) -> Result<Self, Error> {
         // Open the file if it exists, otherwise assume it is a new file (and thus empty).
         let (rope, encoding) = if path.exists() {
@@ -521,7 +539,7 @@ impl Document {
             (Rope::from(DEFAULT_LINE_ENDING.as_str()), encoding)
         };
 
-        let mut doc = Self::from(rope, Some(encoding), config);
+        let mut doc = Self::from(rope, Some(encoding), config, words_completion);
 
         // set the path and try detecting the language
         doc.set_path(Some(path))?;
@@ -531,7 +549,15 @@ impl Document {
 
         doc.detect_indent_and_line_ending();
 
+        doc.extract_words(doc.text().to_string());
+
         Ok(doc)
+    }
+
+    fn extract_words(&self, text: String) {
+        if let Some(words_completion) = &self.words_completion {
+            words_completion.extract_words(self.id, text);
+        }
     }
 
     /// The same as [`format`], but only returns formatting changes if auto-formatting
@@ -643,8 +669,6 @@ impl Document {
     > {
         let path = path.map(|path| path.into());
         self.save_impl(path, force)
-
-        // futures_util::future::Ready<_>,
     }
 
     /// The `Document`'s text is encoded according to its encoding and written to the file located
@@ -679,6 +703,7 @@ impl Document {
 
         let identifier = self.path().map(|_| self.identifier());
         let language_server = self.language_server.clone();
+        let words_completion = self.words_completion.clone();
 
         // mark changes up to now as saved
         let current_rev = self.get_current_revision();
@@ -737,6 +762,10 @@ impl Document {
                 }
             }
 
+            if let Some(words_completion) = words_completion {
+                words_completion.extract_words(doc_id, text.to_string());
+            }
+
             Ok(event)
         };
 
@@ -793,6 +822,8 @@ impl Document {
         self.last_saved_time = SystemTime::now();
 
         self.detect_indent_and_line_ending();
+
+        self.extract_words(self.text().to_string());
 
         match provider_registry.get_diff_base(&path) {
             Some(diff_base) => self.set_diff_base(diff_base, redraw_handle),
@@ -920,6 +951,8 @@ impl Document {
 
         let old_doc = self.text().clone();
 
+        let old_pos = self.selection(view_id).primary().cursor(old_doc.slice(..));
+
         let success = transaction.changes().apply(&mut self.text);
 
         if success {
@@ -1022,6 +1055,49 @@ impl Document {
 
                 if let Some(notify) = notify {
                     tokio::spawn(notify);
+                }
+            }
+
+            // find affected lines, sync lines text with doc-line index
+            if let Some(words_completion) = &self.words_completion {
+                let new_pos = self
+                    .selection(view_id)
+                    .primary()
+                    .cursor(self.text.slice(..));
+
+                let old_line = old_doc.char_to_line(old_pos);
+                let new_line = self.text.char_to_line(new_pos);
+
+                if old_line == new_line {
+                    words_completion.extract_line_words(
+                        self.id,
+                        vec![(old_line, self.text.get_line(old_line).map(String::from))],
+                    );
+                } else {
+                    let range = if old_line < new_line {
+                        old_line..new_line
+                    } else {
+                        new_line..old_line
+                    };
+
+                    if range.end - range.start > CHANGED_LINES_TO_PROCESS_WHOLE_DOC {
+                        // on too many lines changed - use whole text
+                        words_completion.extract_words(self.id, self.text.to_string());
+                    } else {
+                        let lines_text = range
+                            .into_iter()
+                            .map(|line_idx| {
+                                if let Some(line_text) = self.text.get_line(line_idx) {
+                                    (line_idx, Some(line_text.to_string()))
+                                } else {
+                                    // line not found - mark it to remove
+                                    (line_idx, None)
+                                }
+                            })
+                            .collect::<Vec<(usize, Option<String>)>>();
+
+                        words_completion.extract_line_words(self.id, lines_text);
+                    }
                 }
             }
         }
@@ -1263,6 +1339,10 @@ impl Document {
     pub fn language_server(&self) -> Option<&helix_lsp::Client> {
         let server = self.language_server.as_deref()?;
         server.is_initialized().then_some(server)
+    }
+
+    pub fn words_completion(&self) -> Option<&WordsCompletion> {
+        self.words_completion.as_deref()
     }
 
     pub fn diff_handle(&self) -> Option<&DiffHandle> {
@@ -1545,6 +1625,7 @@ mod test {
             text,
             None,
             Arc::new(ArcSwap::new(Arc::new(Config::default()))),
+            None,
         );
         let view = ViewId::default();
         doc.set_selection(view, Selection::single(0, 0));
@@ -1583,6 +1664,7 @@ mod test {
             text,
             None,
             Arc::new(ArcSwap::new(Arc::new(Config::default()))),
+            None,
         );
         let view = ViewId::default();
         doc.set_selection(view, Selection::single(5, 5));
@@ -1696,7 +1778,7 @@ mod test {
     #[test]
     fn test_line_ending() {
         assert_eq!(
-            Document::default(Arc::new(ArcSwap::new(Arc::new(Config::default()))))
+            Document::default(Arc::new(ArcSwap::new(Arc::new(Config::default()))), None)
                 .text()
                 .to_string(),
             DEFAULT_LINE_ENDING.as_str()
