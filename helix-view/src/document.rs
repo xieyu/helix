@@ -171,6 +171,9 @@ pub struct Document {
     // for completion
     words_completion: Option<Arc<WordsCompletion>>,
     diff_handle: Option<DiffHandle>,
+
+    // when document was used for most-recent-used buffer picker
+    pub focused_at: std::time::Instant,
     version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
 }
 
@@ -498,6 +501,7 @@ impl Document {
             modified_since_accessed: false,
             language_server: None,
             diff_handle: None,
+            focused_at: std::time::Instant::now(),
             config,
             words_completion,
             version_control_head: None,
@@ -937,6 +941,11 @@ impl Document {
         if self.selections.get(&view_id).is_none() {
             self.reset_selection(view_id);
         }
+    }
+
+    /// Mark document as recent used for MRU sorting
+    pub fn mark_as_focused(&mut self) {
+        self.focused_at = std::time::Instant::now();
     }
 
     /// Remove a view's selection and inlay hints from this document.
