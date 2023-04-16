@@ -46,9 +46,8 @@ pub use helix_core::register::Registers;
 use helix_core::{
     auto_pairs::AutoPairs,
     syntax::{self, AutoPairConfig, SoftWrap},
-    Change,
+    Change, Position, Selection,
 };
-use helix_core::{Position, Selection};
 use helix_dap as dap;
 use helix_lsp::lsp;
 
@@ -335,6 +334,8 @@ pub struct Config {
     pub workspace_lsp_roots: Vec<PathBuf>,
     /// Icons configuration
     pub icons: IconsConfig,
+    /// Draw border around popups.
+    pub popup_border: PopupBorderConfig,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -767,6 +768,15 @@ impl Default for IndentGuidesConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PopupBorderConfig {
+    None,
+    All,
+    Popup,
+    Menu,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -809,6 +819,7 @@ impl Default for Config {
             completion_replace: false,
             workspace_lsp_roots: Vec::new(),
             icons: IconsConfig::default(),
+            popup_border: PopupBorderConfig::None,
         }
     }
 }

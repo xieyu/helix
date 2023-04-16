@@ -15,7 +15,8 @@ use super::{align_view, push_jump, Align, Context, Editor, Open};
 use helix_core::{path, text_annotations::InlineAnnotation, Selection};
 use helix_view::{
     document::{DocumentInlayHints, DocumentInlayHintsId, Mode},
-    editor::Action,
+    editor::{Action, PopupBorderConfig},
+    graphics::Margin,
     icons::{self, Icon, Icons},
     theme::Style,
     Document, View,
@@ -79,7 +80,7 @@ impl ui::menu::Item for lsp::Location {
 
         // Most commonly, this will not allocate, especially on Unix systems where the root prefix
         // is a simple `/` and not `C:\` (with whatever drive letter)
-        write!(&mut res, ":{}", self.range.start.line)
+        write!(&mut res, ":{}", self.range.start.line + 1)
             .expect("Will only failed if allocating fail");
         res.into()
     }
@@ -726,7 +727,20 @@ pub fn code_action(cx: &mut Context) {
             });
             picker.move_down(); // pre-select the first item
 
-            let popup = Popup::new("code-action", picker).with_scrollbar(false);
+            let border_config = &editor.config().popup_border;
+
+            let margin = if border_config == &PopupBorderConfig::All
+                || border_config == &PopupBorderConfig::Menu
+            {
+                Margin::vertical(1)
+            } else {
+                Margin::none()
+            };
+
+            let popup = Popup::new("code-action", picker)
+                .with_scrollbar(false)
+                .margin(margin);
+
             compositor.replace_or_push("code-action", popup);
         },
     )
